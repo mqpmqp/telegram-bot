@@ -193,3 +193,24 @@ class ImageChartConsoleTests(unittest.TestCase):
         third = MingLiConsole(self.console.send, database, third_runtime)
         self.assertTrue(self.arun(third.confirm("42", "c", "确认")))
         self.assertEqual([], third_runtime.calls)
+
+    def test_restart_resumes_confirmed_session_before_runtime_claim(self) -> None:
+        database = str(Path(self.tmp.name) / "confirmed-restart.sqlite3")
+        first = MingLiConsole(self.console.send, database, FakeRuntime())
+        self.arun(first.image_chart("42", "c", _provider_result()))
+        pending = first.sessions[("c", "42")]
+        pending.data["candidate"]["gender"] = "female"
+        first._persist_image_session(pending, state="CONFIRMED")
+
+        runtime = FakeRuntime()
+        restarted = MingLiConsole(self.console.send, database, runtime)
+        self.assertTrue(self.arun(restarted.confirm("42", "c", "确认")))
+        self.assertEqual(1, len(runtime.calls))
+        self.assertEqual(
+            restarted.sessions[("c", "42")].data["trace_id"],
+            runtime.calls[0]["trace_id"],
+        )
+        self.assertEqual(
+            restarted.sessions[("c", "42")].data["runtime_idempotency_key"],
+            runtime.calls[0]["idempotency_key"],
+        )
