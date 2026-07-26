@@ -164,3 +164,32 @@ class ImageChartConsoleTests(unittest.TestCase):
 
         self.assertTrue(self.arun(self.console.text("42", "c", "/cancel")))
         self.assertNotIn(("c", "42"), self.console.sessions)
+
+    def test_restart_restores_confirmation_and_runtime_idempotency(self) -> None:
+        database = str(Path(self.tmp.name) / "restart.sqlite3")
+        first = MingLiConsole(self.console.send, database, FakeRuntime())
+        self.arun(
+            first.image_chart(
+                "42",
+                "c",
+                _provider_result(),
+                bot_id="bot-a",
+                update_id="100",
+                message_id="10",
+                image_hash="sha256:image-a",
+                vision_provider="vision-a",
+                vision_request_id="request-a",
+            )
+        )
+
+        second_runtime = FakeRuntime()
+        second = MingLiConsole(self.console.send, database, second_runtime)
+        self.assertIn(("c", "42"), second.sessions)
+        self.assertTrue(self.arun(second.confirm("42", "c", "确认")))
+        self.assertTrue(self.arun(second.confirm("42", "c", "女")))
+        self.assertEqual(1, len(second_runtime.calls))
+
+        third_runtime = FakeRuntime()
+        third = MingLiConsole(self.console.send, database, third_runtime)
+        self.assertTrue(self.arun(third.confirm("42", "c", "确认")))
+        self.assertEqual([], third_runtime.calls)
