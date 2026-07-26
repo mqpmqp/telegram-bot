@@ -78,8 +78,8 @@ class ImageChartConsoleTests(unittest.TestCase):
     def test_candidate_is_displayed_and_runtime_is_not_called_before_confirmation(self) -> None:
         self.assertTrue(self.arun(self.console.image_chart("42", "c", _provider_result())))
 
-        self.assertEqual("image_chart", self.console.sessions["42"].mode)
-        self.assertEqual("awaiting_confirmation", self.console.sessions["42"].step)
+        self.assertEqual("image_chart", self.console.sessions[("c", "42")].mode)
+        self.assertEqual("awaiting_confirmation", self.console.sessions[("c", "42")].step)
         self.assertEqual([], self.runtime.calls)
         reply = self.sent[-1][1]
         self.assertIn("年柱：甲子", reply)
@@ -89,28 +89,26 @@ class ImageChartConsoleTests(unittest.TestCase):
         self.arun(self.console.image_chart("42", "c", _provider_result()))
         self.assertTrue(self.arun(self.console.confirm("42", "c", "年柱=乙丑")))
 
-        self.assertEqual("乙丑", self.console.sessions["42"].data["candidate"]["year_pillar"])
-        self.assertEqual("awaiting_confirmation", self.console.sessions["42"].step)
+        self.assertEqual("乙丑", self.console.sessions[("c", "42")].data["candidate"]["year_pillar"])
+        self.assertEqual("awaiting_confirmation", self.console.sessions[("c", "42")].step)
         self.assertEqual([], self.runtime.calls)
         self.assertIn("尚未确认", self.sent[-1][1])
 
-    def test_confirmed_candidate_requires_independent_birth_data_before_runtime(self) -> None:
+    def test_confirmed_candidate_without_gender_asks_only_for_gender(self) -> None:
         self.arun(self.console.image_chart("42", "c", _provider_result()))
         self.assertTrue(self.arun(self.console.confirm("42", "c", "确认图片候选")))
 
-        self.assertEqual("new", self.console.sessions["42"].mode)
+        self.assertEqual("awaiting_gender", self.console.sessions[("c", "42")].step)
         self.assertEqual([], self.runtime.calls)
-        self.assertIn("独立补充完整出生资料", self.sent[-1][1])
+        self.assertIn("只需回复男或女", self.sent[-1][1])
 
-    def test_final_independent_confirmation_calls_runtime_once_only(self) -> None:
+    def test_gender_reply_dispatches_runtime_once_only(self) -> None:
         self.arun(self.console.image_chart("42", "c", _provider_result()))
         self.arun(self.console.confirm("42", "c", "确认图片候选"))
-        self._complete_independent_birth_data()
-
         self.assertEqual([], self.runtime.calls)
-        self.assertTrue(self.arun(self.console.confirm("42", "c", "确认并分析")))
+        self.assertTrue(self.arun(self.console.confirm("42", "c", "女")))
         self.assertEqual(1, len(self.runtime.calls))
-        self.assertFalse(self.arun(self.console.confirm("42", "c", "确认并分析")))
+        self.assertTrue(self.arun(self.console.confirm("42", "c", "确认")))
         self.assertEqual(1, len(self.runtime.calls))
 
     def test_invalid_or_incomplete_provider_response_never_creates_candidate(self) -> None:
