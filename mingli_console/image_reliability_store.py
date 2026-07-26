@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 
 def _now() -> str:
@@ -24,11 +25,16 @@ class ImageReliabilityStore:
         self.path = Path(path).expanduser().resolve()
         self._migrate()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 10000")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _migrate(self) -> None:
         with self._connect() as database:
@@ -173,6 +179,26 @@ class ImageReliabilityStore:
         except sqlite3.IntegrityError:
             return False
 
+    def release_image_hash(
+        self,
+        *,
+        bot_id: str,
+        chat_id: str,
+        user_id: str,
+        image_hash: str,
+        event_id: int,
+    ) -> bool:
+        with self._connect() as database:
+            cursor = database.execute(
+                """
+                DELETE FROM telegram_image_hashes
+                WHERE bot_id=? AND chat_id=? AND user_id=?
+                  AND image_hash=? AND event_id=?
+                """,
+                (bot_id, chat_id, user_id, image_hash, event_id),
+            )
+        return cursor.rowcount == 1
+
     def save_session(self, record: Mapping[str, Any]) -> None:
         candidate = record["candidate"]
         values = (
@@ -294,11 +320,17 @@ class ImageReliabilityStore:
         now = _now()
         with self._connect() as database:
             database.execute(
-                "UPDATE image_sessions SET state=?, updated_at=? WHERE session_id=?",
+                """
+                UPDATE image_sessions SET state=?, updated_at=?
+                WHERE session_id=? AND state NOT IN ('COMPLETED', 'FAILED')
+                """,
                 (status, now, session_id),
             )
             database.execute(
-                "UPDATE image_audits SET status=?, updated_at=? WHERE case_id=?",
+                """
+                UPDATE image_audits SET status=?, updated_at=?
+                WHERE case_id=? AND status NOT IN ('COMPLETED', 'FAILED')
+                """,
                 (status, now, session_id),
             )
 
