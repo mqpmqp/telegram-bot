@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -501,12 +502,75 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
         self.assertEqual(1, session.data["candidate_reply_count"])
         self.assertEqual(1, len(self.sent))
 
+    def test_same_image_can_retry_after_provider_failure(self) -> None:
+        image = b"retryable-chart-image"
+        first = FakeMedia(500, 700, FakeFile(content=image))
+        second = FakeMedia(500, 700, FakeFile(content=image))
+        vision_calls = 0
+
+        async def failing_vision(**kwargs):
+            nonlocal vision_calls
+            vision_calls += 1
+            raise RuntimeError("synthetic provider failure")
+
+        async def successful_vision(**kwargs):
+            nonlocal vision_calls
+            vision_calls += 1
+            return json.dumps(_provider_result())
+
+        self._run_media_with_vision(
+            self.update_for(photos=[first], update_id=724, message_id=725),
+            failing_vision,
+        )
+        self._run_media_with_vision(
+            self.update_for(photos=[second], update_id=726, message_id=727),
+            successful_vision,
+        )
+
+        self.assertEqual(2, vision_calls)
+        self.assertIn(("chat", "42"), self.console.sessions)
+
     def test_duplicate_confirmation_event_is_consumed_once(self) -> None:
         payload = _provider_result()
         payload["candidates"]["gender"] = _field("元女")  # type: ignore[index]
         self._run_provider_payload(payload)
 
         self._run_text("确认", update_id=730, message_id=731)
+        sent_after_first = len(self.sent)
         self._run_text("确认", update_id=730, message_id=731)
 
         self.assertEqual(1, len(self.runtime.calls))
+        self.assertEqual(sent_after_first, len(self.sent))
+
+    def test_successful_chain_persists_adapter_audit_metadata(self) -> None:
+        image = b"audited-chart-image"
+        media = FakeMedia(500, 700, FakeFile(content=image))
+        payload = _provider_result()
+        payload["candidates"]["gender"] = _field("元女")  # type: ignore[index]
+
+        async def vision(**kwargs):
+            return json.dumps(payload, ensure_ascii=False)
+
+        self._run_media_with_vision(
+            self.update_for(photos=[media], update_id=740, message_id=741),
+            vision,
+        )
+        session = self.console.sessions[("chat", "42")]
+        self._run_text("确认", update_id=742, message_id=743)
+
+        audit = self.console.image_store.get_audit(session.data["trace_id"])
+        self.assertIsNotNone(audit)
+        assert audit is not None
+        self.assertEqual("42", audit["telegram_user_id"])
+        self.assertEqual("chat", audit["telegram_chat_id"])
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(image).hexdigest(),
+            audit["image_hash"],
+        )
+        self.assertEqual("hermes.vision_analyze_tool", audit["vision_provider"])
+        self.assertTrue(audit["vision_request_id"])
+        self.assertTrue(audit["candidate_pillars"])
+        self.assertTrue(audit["confirmed_pillars"])
+        self.assertTrue(audit["runtime_called_at"])
+        self.assertTrue(audit["runtime_result_hash"])
+        self.assertEqual("COMPLETED", audit["status"])

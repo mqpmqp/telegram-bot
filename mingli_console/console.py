@@ -11,10 +11,11 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from mingli_console.image_reliability_store import ImageReliabilityStore
 
@@ -69,7 +70,7 @@ class CaseRepository:
         if not str(self.path).startswith(str(Path.home().resolve())):
             raise ValueError("MINGLI_CASES_DB must remain under the user home directory")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS cases (
               case_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, display_name TEXT,
               gender TEXT, calendar_type TEXT, birth_datetime TEXT, birth_location TEXT,
@@ -83,20 +84,29 @@ class CaseRepository:
               confidence TEXT, created_at TEXT NOT NULL
             )""")
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def save(self, case: dict[str, Any]) -> None:
         fields = ["case_id", "customer_id", "display_name", "gender", "calendar_type", "birth_datetime", "birth_location", "true_solar_time_policy", "topic", "reality_context", "normalized_input", "mingli_commit_sha", "runtime_version", "result", "confidence", "created_at", "updated_at", "status"]
         values = [json.dumps(case.get(k), ensure_ascii=False) if isinstance(case.get(k), (dict, list)) else case.get(k) for k in fields]
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute(f"INSERT OR REPLACE INTO cases ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", values)
 
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT case_id,display_name,topic,confidence,status,updated_at FROM cases ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 50)),)).fetchall()
         return [dict(row) for row in rows]
 
     def search(self, query: str = "", topic: str = "") -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             if query:
                 rows = db.execute("SELECT * FROM cases WHERE case_id LIKE ? OR display_name LIKE ? ORDER BY updated_at DESC", (f"%{query}%", f"%{query}%")).fetchall()
@@ -107,19 +117,19 @@ class CaseRepository:
         return [dict(row) for row in rows]
 
     def get(self, case_id: str) -> dict[str, Any] | None:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
         return dict(row) if row else None
 
     def save_revision(self, case_id: str, result: str, sha: str, runtime_version: str | None, confidence: str = "low") -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             cur = db.execute("INSERT INTO case_revisions(case_id,mingli_commit_sha,runtime_version,result,confidence,created_at) VALUES (?,?,?,?,?,?)", (case_id, sha, runtime_version, result, confidence, now))
             return int(cur.lastrowid)
 
     def revisions(self, case_id: str) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT * FROM case_revisions WHERE case_id = ? ORDER BY revision_id", (case_id,)).fetchall()
         return [dict(row) for row in rows]
@@ -370,6 +380,23 @@ class MingLiConsole:
             event_id=event_id,
         )
 
+    def release_image_hash(
+        self,
+        *,
+        bot_id: str,
+        chat_id: str,
+        user_id: str,
+        image_hash: str,
+        event_id: int,
+    ) -> bool:
+        return self.image_store.release_image_hash(
+            bot_id=bot_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            image_hash=image_hash,
+            event_id=event_id,
+        )
+
     async def _reply(self, chat_id: str, text: str) -> None:
         for part in chunks(text):
             await self.send(chat_id, part)
@@ -494,6 +521,31 @@ class MingLiConsole:
             await self._reply(chat_id, "图片命盘识别暂不可用。请手动输入四柱或完整出生资料；如果是从图片读出的四柱，请先确认：请确认我读的四柱和日主是否正确？")
         return True
 
+    def _record_image_runtime_completion(
+        self,
+        session: Session,
+        *,
+        confirmed_pillars: object,
+        runtime_result_hash: str | None,
+        status: str,
+    ) -> bool:
+        try:
+            self.image_store.complete_runtime(
+                str(session.data["session_id"]),
+                confirmed_pillars=confirmed_pillars,
+                runtime_result_hash=runtime_result_hash,
+                status=status,
+            )
+            return True
+        except sqlite3.Error as exc:
+            session.data["audit_persistence_failed"] = True
+            log.warning(
+                "MingLi image Runtime completion audit failed for trace=%s: %s",
+                session.data.get("trace_id"),
+                type(exc).__name__,
+            )
+            return False
+
     async def _dispatch_confirmed_image(self, user_id: str, chat_id: str, session: Session) -> bool:
         if session.data.get("runtime_dispatch_attempted"):
             await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
@@ -538,8 +590,8 @@ class MingLiConsole:
             )
         except asyncio.TimeoutError:
             session.step = "done"
-            self.image_store.complete_runtime(
-                session_id,
+            self._record_image_runtime_completion(
+                session,
                 confirmed_pillars=candidate,
                 runtime_result_hash=None,
                 status="FAILED",
@@ -549,8 +601,8 @@ class MingLiConsole:
             return True
         except Exception as exc:
             session.step = "done"
-            self.image_store.complete_runtime(
-                session_id,
+            self._record_image_runtime_completion(
+                session,
                 confirmed_pillars=candidate,
                 runtime_result_hash=None,
                 status="FAILED",
@@ -562,8 +614,8 @@ class MingLiConsole:
         final = str(result.get("final_answer", "")).strip()
         if not final:
             session.step = "done"
-            self.image_store.complete_runtime(
-                session_id,
+            self._record_image_runtime_completion(
+                session,
                 confirmed_pillars=candidate,
                 runtime_result_hash=None,
                 status="FAILED",
@@ -578,8 +630,8 @@ class MingLiConsole:
             separators=(",", ":"),
         )
         result_hash = "sha256:" + hashlib.sha256(result_json.encode("utf-8")).hexdigest()
-        self.image_store.complete_runtime(
-            session_id,
+        self._record_image_runtime_completion(
+            session,
             confirmed_pillars=candidate,
             runtime_result_hash=result_hash,
             status="COMPLETED",
