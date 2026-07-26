@@ -138,3 +138,10 @@ class ImageChartConsoleTests(unittest.TestCase):
 
         self.assertIn("图片会先识别候选四柱", "\n".join(text for _, text in self.sent))
         self.assertEqual([], self.runtime.calls)
+
+    def test_same_user_in_different_chats_keeps_distinct_image_sessions(self) -> None:
+        self.arun(self.console.image_chart("42", "chat-a", _provider_result()))
+        self.arun(self.console.image_chart("42", "chat-b", _provider_result()))
+
+        self.assertIn(("chat-a", "42"), self.console.sessions)
+        self.assertIn(("chat-b", "42"), self.console.sessions)
