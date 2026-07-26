@@ -19,6 +19,10 @@ class FakeRuntime:
         self.calls.append(payload)
         return {"final_answer": "测试结果\n仅供文化研究与娱乐参考。", "calculation_version": "test"}
 
+    def confirmed_pillars(self, payload: dict) -> dict:
+        self.calls.append(payload)
+        return {"final_answer": "图片命盘结果\n仅供文化研究与娱乐参考。"}
+
 
 def _field(value: str, *, confidence: str = "high", source: str = "visible", warning: str = "") -> dict[str, str]:
     return {"value": value, "confidence": confidence, "source": source, "warning": warning}
@@ -43,7 +47,7 @@ class ImageChartConsoleTests(unittest.TestCase):
         self.old_repo = os.environ.get("MINGLI_REPO")
         os.environ["TELEGRAM_ADMIN_IDS"] = "42"
         self.assertTrue(self.old_repo, "MINGLI_REPO must point to the isolated MingLi worktree")
-        self.tmp = tempfile.TemporaryDirectory(dir=Path.home())
+        self.tmp = tempfile.TemporaryDirectory(dir=Path.home(), ignore_cleanup_errors=True)
         self.sent: list[tuple[str, str]] = []
 
         async def send(chat_id: str, text: str) -> None:
@@ -145,3 +149,20 @@ class ImageChartConsoleTests(unittest.TestCase):
 
         self.assertIn(("chat-a", "42"), self.console.sessions)
         self.assertIn(("chat-b", "42"), self.console.sessions)
+
+    def test_confirmed_image_dispatches_runtime_once_without_generic_intake(self) -> None:
+        response = _provider_result()
+        response["candidates"]["gender"] = _field("\u5143\u5973")  # type: ignore[index]
+        self.arun(self.console.image_chart("42", "c", response))
+
+        self.assertTrue(self.arun(self.console.confirm("42", "c", "确认")))
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("image_chart_confirmation", self.runtime.calls[0])
+        self.assertTrue(self.arun(self.console.confirm("42", "c", "确认")))
+        self.assertEqual(1, len(self.runtime.calls))
+
+    def test_cancel_clears_the_active_image_session(self) -> None:
+        self.arun(self.console.image_chart("42", "c", _provider_result()))
+
+        self.assertTrue(self.arun(self.console.text("42", "c", "/cancel")))
+        self.assertNotIn(("c", "42"), self.console.sessions)
