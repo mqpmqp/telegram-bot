@@ -265,6 +265,14 @@ class MingLiConsole:
     def _image_candidate_prompt() -> str:
         return "请回复“确认”直接分析；如需更正，请发送：年柱=甲子、月柱=乙丑、日柱=丙寅、时柱=丁卯、日主=丙 或 性别=男。更正后必须再次确认。"
 
+    @staticmethod
+    def _image_session_key(user_id: str, chat_id: str) -> tuple[str, str]:
+        return (str(chat_id), str(user_id))
+
+    def _image_session(self, user_id: str, chat_id: str) -> Session | None:
+        session = self.sessions.get(self._image_session_key(user_id, chat_id))
+        return session if isinstance(session, Session) and session.mode == "image_chart" else None
+
     async def image_chart(self, user_id: str, chat_id: str, provider_result: object | None) -> bool:
         """Store a validated image candidate only until explicit user confirmation."""
         if not is_admin(user_id):
@@ -283,8 +291,9 @@ class MingLiConsole:
         candidate = result.candidate
         assert candidate is not None
         values = {**candidate.pillars, "day_master": candidate.day_master, "gender": candidate.gender}
-        self.sessions.pop(str(user_id), None)
-        self.sessions[str(user_id)] = Session(
+        session_key = self._image_session_key(user_id, chat_id)
+        self.sessions.pop(session_key, None)
+        self.sessions[session_key] = Session(
             "image_chart", step="awaiting_confirmation", data={"candidate": values}, expires_at=time.monotonic() + IMAGE_CONFIRM_TTL_SECONDS
         )
         await self._reply(
@@ -336,16 +345,16 @@ class MingLiConsole:
         value = text.strip()
         normalized = value.casefold()
         if session.expires_at is not None and time.monotonic() >= session.expires_at:
-            self.sessions.pop(str(user_id), None)
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_expired: 图片候选已超时，请重新上传。")
             return True
         if normalized in {"否", "不确认", "不對", "不对", "取消", "no", "reject", "cancel"}:
-            self.sessions.pop(str(user_id), None)
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_rejected: 已丢弃图片候选，请重新上传。")
             return True
         candidate = session.data.get("candidate")
         if not isinstance(candidate, dict):
-            self.sessions.pop(str(user_id), None)
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_state_missing: 图片候选已失效，请重新上传。")
             return True
         if session.step == "awaiting_gender":
@@ -501,7 +510,7 @@ class MingLiConsole:
     async def text(self, user_id: str, chat_id: str, text: str) -> bool:
         if not is_admin(user_id):
             return await self._deny(chat_id)
-        session = self.sessions.get(str(user_id))
+        session = self._image_session(user_id, chat_id) or self.sessions.get(str(user_id))
         if not session:
             if text.strip() in {"新客户完整测算", "评论区快速回复", "专项问题分析", "历史案例", "取消当前任务"}:
                 aliases = {"新客户完整测算": "/new", "评论区快速回复": "/quick", "专项问题分析": "/analyze", "历史案例": "/history", "取消当前任务": "/cancel"}
@@ -509,6 +518,10 @@ class MingLiConsole:
             return False
         if text.strip().lower() == "/cancel":
             return await self.command(user_id, chat_id, text)
+        if session.mode == "image_chart" and session.data.get("runtime_dispatch_attempted"):
+            if text.strip().casefold() in {"确认", "確認", "confirm", "confirmed"}:
+                await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
+                return True
         if session.mode == "image_chart" and session.step in {"awaiting_confirmation", "awaiting_gender"}:
             return await self._confirm_image_candidate(user_id, chat_id, session, text)
         if session.mode == "new":
@@ -556,7 +569,7 @@ class MingLiConsole:
 
     async def confirm(self, user_id: str, chat_id: str, text: str) -> bool:
         if not is_admin(user_id): return await self._deny(chat_id)
-        session = self.sessions.get(str(user_id))
+        session = self._image_session(user_id, chat_id) or self.sessions.get(str(user_id))
         if session and session.mode == "image_chart" and session.step in {"awaiting_confirmation", "awaiting_gender"}:
             return await self._confirm_image_candidate(user_id, chat_id, session, text)
         if session and session.mode == "image_chart" and session.data.get("runtime_dispatch_attempted") and text.strip().casefold() in {"确认", "確認", "confirm", "confirmed"}:
