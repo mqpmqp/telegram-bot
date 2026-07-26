@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -214,3 +215,70 @@ class ImageChartConsoleTests(unittest.TestCase):
             restarted.sessions[("c", "42")].data["runtime_idempotency_key"],
             runtime.calls[0]["idempotency_key"],
         )
+
+    def test_runtime_failure_remains_idempotent_after_restart(self) -> None:
+        class FailingRuntime(FakeRuntime):
+            def confirmed_pillars(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                raise RuntimeError("synthetic runtime failure")
+
+        database = str(Path(self.tmp.name) / "failed-runtime.sqlite3")
+        failing_runtime = FailingRuntime()
+        first = MingLiConsole(self.console.send, database, failing_runtime)
+        response = _provider_result()
+        response["candidates"]["gender"] = _field("元女")  # type: ignore[index]
+        self.arun(first.image_chart("42", "c", response))
+        self.assertTrue(self.arun(first.confirm("42", "c", "确认")))
+        self.assertEqual(1, len(failing_runtime.calls))
+
+        restarted_runtime = FakeRuntime()
+        restarted = MingLiConsole(self.console.send, database, restarted_runtime)
+        self.assertTrue(self.arun(restarted.confirm("42", "c", "确认")))
+        self.assertEqual([], restarted_runtime.calls)
+        audit = restarted.image_store.get_audit(
+            restarted.sessions[("c", "42")].data["trace_id"]
+        )
+        self.assertIsNotNone(audit)
+        assert audit is not None
+        self.assertEqual("FAILED", audit["status"])
+
+    def test_completed_audit_is_not_overwritten_by_cancel_or_replacement(self) -> None:
+        response = _provider_result()
+        response["candidates"]["gender"] = _field("元女")  # type: ignore[index]
+
+        self.arun(self.console.image_chart("42", "c", response))
+        first_trace = self.console.sessions[("c", "42")].data["trace_id"]
+        self.arun(self.console.confirm("42", "c", "确认"))
+        self.arun(self.console.command("42", "c", "/cancel"))
+        first_audit = self.console.image_store.get_audit(first_trace)
+        assert first_audit is not None
+        self.assertEqual("COMPLETED", first_audit["status"])
+
+        self.arun(self.console.image_chart("42", "c", response))
+        second_trace = self.console.sessions[("c", "42")].data["trace_id"]
+        self.arun(self.console.confirm("42", "c", "确认"))
+        self.arun(self.console.image_chart("42", "c", response))
+        second_audit = self.console.image_store.get_audit(second_trace)
+        assert second_audit is not None
+        self.assertEqual("COMPLETED", second_audit["status"])
+
+    def test_runtime_result_is_sent_when_audit_completion_write_fails(self) -> None:
+        database = str(Path(self.tmp.name) / "completion-write-failure.sqlite3")
+        runtime = FakeRuntime()
+        first = MingLiConsole(self.console.send, database, runtime)
+        response = _provider_result()
+        response["candidates"]["gender"] = _field("元女")  # type: ignore[index]
+        self.arun(first.image_chart("42", "c", response))
+
+        def fail_completion(*args, **kwargs):
+            raise sqlite3.OperationalError("synthetic completion failure")
+
+        first.image_store.complete_runtime = fail_completion  # type: ignore[method-assign]
+        self.assertTrue(self.arun(first.confirm("42", "c", "确认")))
+        self.assertEqual(1, len(runtime.calls))
+        self.assertIn("图片命盘结果", self.sent[-1][1])
+
+        restarted_runtime = FakeRuntime()
+        restarted = MingLiConsole(self.console.send, database, restarted_runtime)
+        self.assertTrue(self.arun(restarted.confirm("42", "c", "确认")))
+        self.assertEqual([], restarted_runtime.calls)
