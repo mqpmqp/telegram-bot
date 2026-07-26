@@ -412,7 +412,9 @@ class MingLiConsole:
         if name in {"/start", "/help"}:
             await self._reply(chat_id, self._menu() if name == "/start" else "命令：/new 完整测算｜/quick 评论回复｜/analyze 专项分析｜/history 案例｜/cancel 取消")
         elif name == "/cancel":
-            self.sessions.pop(str(user_id), None); await self._reply(chat_id, "已取消当前任务。")
+            self.sessions.pop(str(user_id), None)
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
+            await self._reply(chat_id, "已取消当前任务。")
         elif name == "/new":
             self.sessions[str(user_id)] = Session("new", data={"fields": []}); await self._reply(chat_id, "新客户完整测算。请依次发送：称呼/案例代号、性别（男/女）、历法（公历/农历）、农历是否闰月（是/否；公历填否）、出生日期（YYYY-MM-DD）、出生时间（HH:MM；未知请明确写未知）、出生地（城市；真太阳时需经纬度）、是否真太阳时（是/否）、主要问题、现实背景、输出模式（简洁版/标准版/详细版）。每次一项。")
         elif name == "/quick":
