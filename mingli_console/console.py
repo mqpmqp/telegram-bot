@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -9,10 +10,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Iterator, Mapping
+
+from mingli_console.image_reliability_store import ImageReliabilityStore
 
 log = logging.getLogger(__name__)
 DISCLAIMER = "仅供文化研究与娱乐参考。"
@@ -65,7 +70,7 @@ class CaseRepository:
         if not str(self.path).startswith(str(Path.home().resolve())):
             raise ValueError("MINGLI_CASES_DB must remain under the user home directory")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS cases (
               case_id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, display_name TEXT,
               gender TEXT, calendar_type TEXT, birth_datetime TEXT, birth_location TEXT,
@@ -79,20 +84,29 @@ class CaseRepository:
               confidence TEXT, created_at TEXT NOT NULL
             )""")
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def save(self, case: dict[str, Any]) -> None:
         fields = ["case_id", "customer_id", "display_name", "gender", "calendar_type", "birth_datetime", "birth_location", "true_solar_time_policy", "topic", "reality_context", "normalized_input", "mingli_commit_sha", "runtime_version", "result", "confidence", "created_at", "updated_at", "status"]
         values = [json.dumps(case.get(k), ensure_ascii=False) if isinstance(case.get(k), (dict, list)) else case.get(k) for k in fields]
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute(f"INSERT OR REPLACE INTO cases ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", values)
 
     def recent(self, limit: int = 10) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT case_id,display_name,topic,confidence,status,updated_at FROM cases ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 50)),)).fetchall()
         return [dict(row) for row in rows]
 
     def search(self, query: str = "", topic: str = "") -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             if query:
                 rows = db.execute("SELECT * FROM cases WHERE case_id LIKE ? OR display_name LIKE ? ORDER BY updated_at DESC", (f"%{query}%", f"%{query}%")).fetchall()
@@ -103,19 +117,19 @@ class CaseRepository:
         return [dict(row) for row in rows]
 
     def get(self, case_id: str) -> dict[str, Any] | None:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             row = db.execute("SELECT * FROM cases WHERE case_id = ?", (case_id,)).fetchone()
         return dict(row) if row else None
 
     def save_revision(self, case_id: str, result: str, sha: str, runtime_version: str | None, confidence: str = "low") -> int:
         now = datetime.now(timezone.utc).isoformat()
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             cur = db.execute("INSERT INTO case_revisions(case_id,mingli_commit_sha,runtime_version,result,confidence,created_at) VALUES (?,?,?,?,?,?)", (case_id, sha, runtime_version, result, confidence, now))
             return int(cur.lastrowid)
 
     def revisions(self, case_id: str) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT * FROM case_revisions WHERE case_id = ? ORDER BY revision_id", (case_id,)).fetchall()
         return [dict(row) for row in rows]
@@ -228,10 +242,160 @@ class MingLiConsole:
     """Telegram-facing state machine. Transport is injected for testability."""
     def __init__(self, send: Callable[[str, str], Awaitable[None]], db_path: str | None = None, runtime: MingLiRuntimeAdapter | None = None):
         self.send = send
-        self.sessions: dict[str, Session] = {}
+        self.sessions: dict[object, Session] = {}
         self.completed: dict[str, dict[str, Any]] = {}
         self.repo = CaseRepository(db_path)
+        self.image_store = ImageReliabilityStore(self.repo.path)
         self.runtime = runtime or MingLiRuntimeAdapter()
+        self._restore_image_sessions()
+
+    @staticmethod
+    def _step_for_state(state: str) -> str:
+        return {
+            "AWAITING_CONFIRMATION": "awaiting_confirmation",
+            "AWAITING_GENDER": "awaiting_gender",
+            "CONFIRMED": "runtime_ready",
+            "RUNTIME_PENDING": "runtime_ready",
+            "COMPLETED": "done",
+        }.get(state, "done")
+
+    @staticmethod
+    def _is_image_confirmation_reply(value: str) -> bool:
+        return value.strip().casefold() in {
+            "确认",
+            "確認",
+            "confirm",
+            "confirmed",
+            "确认图片候选",
+            "确认并分析",
+            "男",
+            "男命",
+            "male",
+            "女",
+            "女命",
+            "female",
+        }
+
+    @staticmethod
+    def _image_confirmation_handoff(data: Mapping[str, Any]) -> dict[str, Any]:
+        candidate = data["candidate"]
+        return {
+            "contract": "mingli-image-chart-confirmation@1.2",
+            "confirmation_status": "confirmed",
+            "runtime_dispatch": "confirmed_pillars",
+            "trace_id": data["trace_id"],
+            "idempotency_key": data["runtime_idempotency_key"],
+            "chart_candidate": {
+                "pillars": {
+                    "year": candidate["year_pillar"],
+                    "month": candidate["month_pillar"],
+                    "day": candidate["day_pillar"],
+                    "hour": candidate["hour_pillar"],
+                },
+                "day_master": candidate["day_master"],
+                "gender": candidate["gender"],
+                "requires_confirmation": False,
+                "confidence": "high",
+                "warnings": [],
+                "birth_datetime": None,
+                "birth_place": None,
+                "calendar_type": None,
+            },
+        }
+
+    def _restore_image_sessions(self) -> None:
+        for record in self.image_store.load_sessions(now=time.time()):
+            data = dict(record)
+            candidate = data.pop("candidate")
+            data["candidate"] = candidate
+            data["runtime_dispatch_attempted"] = (
+                int(data.get("runtime_invocation_count", 0)) > 0
+            )
+            if (
+                data.get("state") == "CONFIRMED"
+                and not data["runtime_dispatch_attempted"]
+            ):
+                data["image_chart_confirmation"] = self._image_confirmation_handoff(
+                    data
+                )
+            self.sessions[
+                self._image_session_key(record["user_id"], record["chat_id"])
+            ] = Session(
+                "image_chart",
+                step=self._step_for_state(str(record["state"])),
+                data=data,
+                expires_at=float(record["expires_at"]),
+            )
+
+    def _persist_image_session(self, session: Session, *, state: str) -> None:
+        session.data["state"] = state
+        session.data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        session.data["expires_at"] = float(session.expires_at or time.time())
+        self.image_store.save_session(session.data)
+
+    def _finish_image_session(self, session: Session, *, state: str) -> None:
+        session.data["state"] = state
+        session.data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.image_store.delete_session(str(session.data["session_id"]), status=state)
+
+    def has_image_session(self, user_id: str, chat_id: str) -> bool:
+        return self._image_session(user_id, chat_id) is not None
+
+    def claim_telegram_event(
+        self,
+        *,
+        bot_id: str,
+        update_id: str | None,
+        chat_id: str,
+        message_id: str | None,
+        user_id: str,
+        event_type: str,
+    ) -> int | None:
+        return self.image_store.claim_event(
+            bot_id=bot_id,
+            update_id=update_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            user_id=user_id,
+            event_type=event_type,
+        )
+
+    def complete_telegram_event(self, event_id: int, status: str) -> None:
+        self.image_store.complete_event(event_id, status)
+
+    def claim_image_hash(
+        self,
+        *,
+        bot_id: str,
+        chat_id: str,
+        user_id: str,
+        image_hash: str,
+        event_id: int | None,
+    ) -> bool:
+        return self.image_store.claim_image_hash(
+            bot_id=bot_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            image_hash=image_hash,
+            event_id=event_id,
+        )
+
+    def release_image_hash(
+        self,
+        *,
+        bot_id: str,
+        chat_id: str,
+        user_id: str,
+        image_hash: str,
+        event_id: int,
+    ) -> bool:
+        return self.image_store.release_image_hash(
+            bot_id=bot_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            image_hash=image_hash,
+            event_id=event_id,
+        )
 
     async def _reply(self, chat_id: str, text: str) -> None:
         for part in chunks(text):
@@ -265,7 +429,27 @@ class MingLiConsole:
     def _image_candidate_prompt() -> str:
         return "请回复“确认”直接分析；如需更正，请发送：年柱=甲子、月柱=乙丑、日柱=丙寅、时柱=丁卯、日主=丙 或 性别=男。更正后必须再次确认。"
 
-    async def image_chart(self, user_id: str, chat_id: str, provider_result: object | None) -> bool:
+    @staticmethod
+    def _image_session_key(user_id: str, chat_id: str) -> tuple[str, str]:
+        return (str(chat_id), str(user_id))
+
+    def _image_session(self, user_id: str, chat_id: str) -> Session | None:
+        session = self.sessions.get(self._image_session_key(user_id, chat_id))
+        return session if isinstance(session, Session) and session.mode == "image_chart" else None
+
+    async def image_chart(
+        self,
+        user_id: str,
+        chat_id: str,
+        provider_result: object | None,
+        *,
+        bot_id: str = "",
+        update_id: str | None = None,
+        message_id: str | None = None,
+        image_hash: str | None = None,
+        vision_provider: str | None = None,
+        vision_request_id: str | None = None,
+    ) -> bool:
         """Store a validated image candidate only until explicit user confirmation."""
         if not is_admin(user_id):
             return await self._deny(chat_id)
@@ -283,10 +467,41 @@ class MingLiConsole:
         candidate = result.candidate
         assert candidate is not None
         values = {**candidate.pillars, "day_master": candidate.day_master, "gender": candidate.gender}
-        self.sessions.pop(str(user_id), None)
-        self.sessions[str(user_id)] = Session(
-            "image_chart", step="awaiting_confirmation", data={"candidate": values}, expires_at=time.monotonic() + IMAGE_CONFIRM_TTL_SECONDS
+        now = datetime.now(timezone.utc).isoformat()
+        session_id = uuid.uuid4().hex
+        trace_id = uuid.uuid4().hex
+        session_key = self._image_session_key(user_id, chat_id)
+        replaced = self.sessions.pop(session_key, None)
+        if isinstance(replaced, Session) and replaced.mode == "image_chart":
+            self._finish_image_session(replaced, state="REPLACED")
+        session = Session(
+            "image_chart",
+            step="awaiting_confirmation",
+            data={
+                "session_id": session_id,
+                "trace_id": trace_id,
+                "platform": "telegram",
+                "bot_id": str(bot_id),
+                "chat_id": str(chat_id),
+                "user_id": str(user_id),
+                "update_id": str(update_id) if update_id not in (None, "") else None,
+                "image_message_id": (
+                    str(message_id) if message_id not in (None, "") else None
+                ),
+                "image_hash": image_hash,
+                "vision_provider": vision_provider,
+                "vision_request_id": vision_request_id,
+                "candidate": values,
+                "runtime_idempotency_key": f"image-runtime:{trace_id}",
+                "candidate_reply_count": 1,
+                "runtime_invocation_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            },
+            expires_at=time.time() + IMAGE_CONFIRM_TTL_SECONDS,
         )
+        self.sessions[session_key] = session
+        self._persist_image_session(session, state="AWAITING_CONFIRMATION")
         await self._reply(
             chat_id,
             "【图片候选四柱】\n"
@@ -306,46 +521,144 @@ class MingLiConsole:
             await self._reply(chat_id, "图片命盘识别暂不可用。请手动输入四柱或完整出生资料；如果是从图片读出的四柱，请先确认：请确认我读的四柱和日主是否正确？")
         return True
 
+    def _record_image_runtime_completion(
+        self,
+        session: Session,
+        *,
+        confirmed_pillars: object,
+        runtime_result_hash: str | None,
+        status: str,
+    ) -> bool:
+        try:
+            self.image_store.complete_runtime(
+                str(session.data["session_id"]),
+                confirmed_pillars=confirmed_pillars,
+                runtime_result_hash=runtime_result_hash,
+                status=status,
+            )
+            return True
+        except sqlite3.Error as exc:
+            session.data["audit_persistence_failed"] = True
+            log.warning(
+                "MingLi image Runtime completion audit failed for trace=%s: %s",
+                session.data.get("trace_id"),
+                type(exc).__name__,
+            )
+            return False
+
     async def _dispatch_confirmed_image(self, user_id: str, chat_id: str, session: Session) -> bool:
         if session.data.get("runtime_dispatch_attempted"):
             await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
             return True
-        session.data["runtime_dispatch_attempted"] = True
+        session_id = str(session.data["session_id"])
+        idempotency_key = str(session.data["runtime_idempotency_key"])
         try:
-            result = await asyncio.wait_for(asyncio.to_thread(self.runtime.confirmed_pillars, {"image_chart_confirmation": session.data["image_chart_confirmation"]}), timeout=float(os.getenv("MINGLI_RUNTIME_TIMEOUT", "30")))
+            claimed = self.image_store.claim_runtime(session_id, idempotency_key)
+        except sqlite3.Error as exc:
+            log.warning(
+                "MingLi image Runtime claim failed for admin=%s: %s",
+                user_id,
+                type(exc).__name__,
+            )
+            await self._reply(
+                chat_id,
+                "MingLi Runtime 暂不可用；幂等状态未能安全保存，本次没有调用 Runtime，请稍后重试。",
+            )
+            return True
+        if not claimed:
+            session.data["runtime_dispatch_attempted"] = True
+            session.data["runtime_invocation_count"] = 1
+            session.step = "done"
+            await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
+            return True
+
+        session.data["runtime_dispatch_attempted"] = True
+        session.data["runtime_invocation_count"] = 1
+        session.expires_at = time.time() + IMAGE_CONFIRM_TTL_SECONDS
+        self._persist_image_session(session, state="RUNTIME_PENDING")
+        candidate = session.data["candidate"]
+        runtime_payload = {
+            "image_chart_confirmation": session.data["image_chart_confirmation"],
+            "trace_id": session.data["trace_id"],
+            "idempotency_key": idempotency_key,
+            "source": "image_confirmed",
+        }
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.runtime.confirmed_pillars, runtime_payload),
+                timeout=float(os.getenv("MINGLI_RUNTIME_TIMEOUT", "30")),
+            )
         except asyncio.TimeoutError:
             session.step = "done"
+            self._record_image_runtime_completion(
+                session,
+                confirmed_pillars=candidate,
+                runtime_result_hash=None,
+                status="FAILED",
+            )
+            session.data["state"] = "FAILED"
             await self._reply(chat_id, "MingLi Runtime 超时；为避免重复计算，本次不会自动重试，请重新上传图片。")
             return True
         except Exception as exc:
             session.step = "done"
+            self._record_image_runtime_completion(
+                session,
+                confirmed_pillars=candidate,
+                runtime_result_hash=None,
+                status="FAILED",
+            )
+            session.data["state"] = "FAILED"
             log.warning("MingLi confirmed-pillar runtime failed for admin=%s: %s", user_id, type(exc).__name__)
             await self._reply(chat_id, "MingLi Runtime 当前不可用或确认内容不符合接口要求；为避免重复计算，请重新上传图片后再试。")
             return True
         final = str(result.get("final_answer", "")).strip()
         if not final:
             session.step = "done"
+            self._record_image_runtime_completion(
+                session,
+                confirmed_pillars=candidate,
+                runtime_result_hash=None,
+                status="FAILED",
+            )
+            session.data["state"] = "FAILED"
             await self._reply(chat_id, "MingLi Runtime 返回结果无效；本次未生成分析，请重新上传图片。")
             return True
+        result_json = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        result_hash = "sha256:" + hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        self._record_image_runtime_completion(
+            session,
+            confirmed_pillars=candidate,
+            runtime_result_hash=result_hash,
+            status="COMPLETED",
+        )
+        session.data["runtime_result_hash"] = result_hash
+        session.data["state"] = "COMPLETED"
         await self._reply(chat_id, final if final.endswith(DISCLAIMER) else final + "\n" + DISCLAIMER)
         session.step = "done"
-        session.expires_at = None
         return True
 
     async def _confirm_image_candidate(self, user_id: str, chat_id: str, session: Session, text: str) -> bool:
         value = text.strip()
         normalized = value.casefold()
-        if session.expires_at is not None and time.monotonic() >= session.expires_at:
-            self.sessions.pop(str(user_id), None)
+        if session.expires_at is not None and time.time() >= session.expires_at:
+            self._finish_image_session(session, state="EXPIRED")
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_expired: 图片候选已超时，请重新上传。")
             return True
         if normalized in {"否", "不确认", "不對", "不对", "取消", "no", "reject", "cancel"}:
-            self.sessions.pop(str(user_id), None)
+            self._finish_image_session(session, state="REJECTED")
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_rejected: 已丢弃图片候选，请重新上传。")
             return True
         candidate = session.data.get("candidate")
         if not isinstance(candidate, dict):
-            self.sessions.pop(str(user_id), None)
+            self._finish_image_session(session, state="FAILED")
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
             await self._reply(chat_id, "confirmation_state_missing: 图片候选已失效，请重新上传。")
             return True
         if session.step == "awaiting_gender":
@@ -370,7 +683,8 @@ class MingLiConsole:
                     await self._reply(chat_id, "validation_failed: 更正值非法，图片候选尚未确认。")
                     return True
                 candidate[field] = corrected
-                session.expires_at = time.monotonic() + IMAGE_CONFIRM_TTL_SECONDS
+                session.expires_at = time.time() + IMAGE_CONFIRM_TTL_SECONDS
+                self._persist_image_session(session, state="AWAITING_CONFIRMATION")
                 await self._reply(chat_id, "corrected_awaiting_confirmation: 图片候选已更新，尚未确认。\n" + self._image_candidate_prompt())
                 return True
             if normalized not in {"确认", "確認", "confirm", "confirmed", "确认图片候选"}:
@@ -385,11 +699,16 @@ class MingLiConsole:
             return True
         if candidate.get("gender") not in {"male", "female"}:
             session.step = "awaiting_gender"
+            session.expires_at = time.time() + IMAGE_CONFIRM_TTL_SECONDS
+            self._persist_image_session(session, state="AWAITING_GENDER")
             await self._reply(chat_id, "gender_required: 四柱与日主已确认。图片未可靠识别性别，现在只需回复男或女；无需补充其他出生资料。")
             return True
-        session.data["image_chart_confirmation"] = {"contract": "mingli-image-chart-confirmation@1.2", "confirmation_status": "confirmed", "runtime_dispatch": "confirmed_pillars", "chart_candidate": {"pillars": pillars, "day_master": candidate["day_master"], "gender": candidate["gender"], "requires_confirmation": False, "confidence": "high", "warnings": [], "birth_datetime": None, "birth_place": None, "calendar_type": None}}
+        session.data["image_chart_confirmation"] = self._image_confirmation_handoff(
+            session.data
+        )
         session.step = "runtime_ready"
-        session.expires_at = None
+        session.expires_at = time.time() + IMAGE_CONFIRM_TTL_SECONDS
+        self._persist_image_session(session, state="CONFIRMED")
         return await self._dispatch_confirmed_image(user_id, chat_id, session)
 
     async def whoami(self, user_id: str, chat_id: str, chat_type: str) -> bool:
@@ -403,7 +722,12 @@ class MingLiConsole:
         if name in {"/start", "/help"}:
             await self._reply(chat_id, self._menu() if name == "/start" else "命令：/new 完整测算｜/quick 评论回复｜/analyze 专项分析｜/history 案例｜/cancel 取消")
         elif name == "/cancel":
-            self.sessions.pop(str(user_id), None); await self._reply(chat_id, "已取消当前任务。")
+            image_session = self._image_session(user_id, chat_id)
+            if image_session is not None:
+                self._finish_image_session(image_session, state="CANCELLED")
+            self.sessions.pop(str(user_id), None)
+            self.sessions.pop(self._image_session_key(user_id, chat_id), None)
+            await self._reply(chat_id, "已取消当前任务。")
         elif name == "/new":
             self.sessions[str(user_id)] = Session("new", data={"fields": []}); await self._reply(chat_id, "新客户完整测算。请依次发送：称呼/案例代号、性别（男/女）、历法（公历/农历）、农历是否闰月（是/否；公历填否）、出生日期（YYYY-MM-DD）、出生时间（HH:MM；未知请明确写未知）、出生地（城市；真太阳时需经纬度）、是否真太阳时（是/否）、主要问题、现实背景、输出模式（简洁版/标准版/详细版）。每次一项。")
         elif name == "/quick":
@@ -501,7 +825,8 @@ class MingLiConsole:
     async def text(self, user_id: str, chat_id: str, text: str) -> bool:
         if not is_admin(user_id):
             return await self._deny(chat_id)
-        session = self.sessions.get(str(user_id))
+        image_session = self._image_session(user_id, chat_id)
+        session = image_session or self.sessions.get(str(user_id))
         if not session:
             if text.strip() in {"新客户完整测算", "评论区快速回复", "专项问题分析", "历史案例", "取消当前任务"}:
                 aliases = {"新客户完整测算": "/new", "评论区快速回复": "/quick", "专项问题分析": "/analyze", "历史案例": "/history", "取消当前任务": "/cancel"}
@@ -509,8 +834,15 @@ class MingLiConsole:
             return False
         if text.strip().lower() == "/cancel":
             return await self.command(user_id, chat_id, text)
-        if session.mode == "image_chart" and session.step in {"awaiting_confirmation", "awaiting_gender"}:
-            return await self._confirm_image_candidate(user_id, chat_id, session, text)
+        if image_session is not None and image_session.data.get("runtime_dispatch_attempted"):
+            if self._is_image_confirmation_reply(text):
+                await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
+                return True
+            session = self.sessions.get(str(user_id))
+            if session is None:
+                return False
+        if image_session is not None and image_session.step in {"awaiting_confirmation", "awaiting_gender"}:
+            return await self._confirm_image_candidate(user_id, chat_id, image_session, text)
         if session.mode == "new":
             return await self._new_step(user_id, chat_id, session, text.strip())
         if session.mode == "quick":
@@ -556,12 +888,22 @@ class MingLiConsole:
 
     async def confirm(self, user_id: str, chat_id: str, text: str) -> bool:
         if not is_admin(user_id): return await self._deny(chat_id)
-        session = self.sessions.get(str(user_id))
-        if session and session.mode == "image_chart" and session.step in {"awaiting_confirmation", "awaiting_gender"}:
-            return await self._confirm_image_candidate(user_id, chat_id, session, text)
-        if session and session.mode == "image_chart" and session.data.get("runtime_dispatch_attempted") and text.strip().casefold() in {"确认", "確認", "confirm", "confirmed"}:
+        image_session = self._image_session(user_id, chat_id)
+        if image_session and image_session.step in {"awaiting_confirmation", "awaiting_gender"}:
+            return await self._confirm_image_candidate(user_id, chat_id, image_session, text)
+        if (
+            image_session
+            and image_session.step == "runtime_ready"
+            and not image_session.data.get("runtime_dispatch_attempted")
+            and self._is_image_confirmation_reply(text)
+        ):
+            return await self._dispatch_confirmed_image(
+                user_id, chat_id, image_session
+            )
+        if image_session and image_session.data.get("runtime_dispatch_attempted") and self._is_image_confirmation_reply(text):
             await self._reply(chat_id, "runtime_already_dispatched: 本次图片命盘已处理，不会重复调用 Runtime。")
             return True
+        session = self.sessions.get(str(user_id))
         if not session or session.mode != "new" or session.step != "confirm": return False
         if text.strip() not in {"确认并分析", "确认"}:
             await self._reply(chat_id, "未确认。请回复“确认并分析”、 “修改资料”或“取消”。"); return True

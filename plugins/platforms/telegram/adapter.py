@@ -10,6 +10,7 @@ Uses python-telegram-bot library for:
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -19,6 +20,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -41,7 +43,7 @@ def _mingli_json_object_once(value: object) -> dict[str, object] | None:
 
 
 def _normalize_mingli_image_provider_result(provider_result: object) -> object:
-    """Unwrap nested JSON provider envelopes without trusting free-form text."""
+    """Unwrap at most one provider envelope without trusting free-form text."""
     def decode(value: object) -> dict[str, object] | None:
         if isinstance(value, str):
             text = value.strip()
@@ -52,27 +54,34 @@ def _normalize_mingli_image_provider_result(provider_result: object) -> object:
             value = _mingli_json_object_once(text)
         return value if isinstance(value, dict) else None
 
-    def visit(value: object, success: bool = False, depth: int = 0) -> dict[str, object] | None:
-        if depth > 8:
+    def candidate_payload(
+        payload: dict[str, object], *, inherited_success: bool = False
+    ) -> dict[str, object] | None:
+        if payload.get("success") is False:
             return None
-        payload = decode(value)
-        if payload is None or payload.get("success") is False:
-            return None
-        success = success or payload.get("success") is True
+        success = inherited_success or payload.get("success") is True
         candidates = payload.get("candidates")
         if success and isinstance(candidates, dict):
             return {"success": True, "candidates": candidates}
         fields = ("year_pillar", "month_pillar", "day_pillar", "hour_pillar", "day_master")
         if success and any(name in payload for name in fields):
             return {"success": True, "candidates": payload}
-        for key in ("analysis", "output_text", "content", "message", "output", "text"):
-            if key in payload:
-                found = visit(payload[key], success, depth + 1)
-                if found is not None:
-                    return found
         return None
 
-    return visit(provider_result) or provider_result
+    root = decode(provider_result)
+    if root is None:
+        return provider_result
+    found = candidate_payload(root)
+    if found is not None:
+        return found
+    if root.get("success") is True:
+        for key in ("analysis", "output_text", "content", "message", "output", "text"):
+            child = decode(root.get(key))
+            if child is not None:
+                found = candidate_payload(child, inherited_success=True)
+                if found is not None:
+                    return found
+    return provider_result
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -8228,6 +8237,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _mingli_bot_id(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+        bot = getattr(context, "bot", None) or getattr(self, "_bot", None)
+        bot_id = getattr(bot, "id", None)
+        return str(bot_id) if bot_id not in (None, "") else "telegram"
+
     async def _handle_mingli_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._mingli_console is None:
             return
@@ -8253,13 +8267,35 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         user = getattr(msg, "from_user", None)
         chat = getattr(msg, "chat", None)
-        handled = await self._mingli_console.confirm(
-            str(getattr(user, "id", "")), str(getattr(chat, "id", "")), msg.text
-        )
-        if not handled:
-            handled = await self._mingli_console.text(
-                str(getattr(user, "id", "")), str(getattr(chat, "id", "")), msg.text
+        user_id = str(getattr(user, "id", ""))
+        chat_id = str(getattr(chat, "id", ""))
+        event_id = None
+        event_status = "FAILED"
+        if self._mingli_console.has_image_session(user_id, chat_id):
+            event_id = self._mingli_console.claim_telegram_event(
+                bot_id=self._mingli_bot_id(context),
+                update_id=getattr(update, "update_id", None),
+                chat_id=chat_id,
+                message_id=getattr(msg, "message_id", None),
+                user_id=user_id,
+                event_type="confirmation",
             )
+            if event_id is None:
+                raise ApplicationHandlerStop()
+        try:
+            handled = await self._mingli_console.confirm(
+                user_id, chat_id, msg.text
+            )
+            if not handled:
+                handled = await self._mingli_console.text(
+                    user_id, chat_id, msg.text
+                )
+            event_status = "COMPLETED" if handled else "NOT_HANDLED"
+        finally:
+            if event_id is not None:
+                self._mingli_console.complete_telegram_event(
+                    event_id, event_status
+                )
         if handled:
             raise ApplicationHandlerStop()
 
@@ -8275,6 +8311,18 @@ class TelegramAdapter(BasePlatformAdapter):
         from mingli_console.console import is_admin
         if not is_admin(user_id):
             await self._mingli_console._deny(chat_id)
+            raise ApplicationHandlerStop()
+
+        bot_id = self._mingli_bot_id(context)
+        event_id = self._mingli_console.claim_telegram_event(
+            bot_id=bot_id,
+            update_id=getattr(update, "update_id", None),
+            chat_id=chat_id,
+            message_id=getattr(msg, "message_id", None),
+            user_id=user_id,
+            event_type="image",
+        )
+        if event_id is None:
             raise ApplicationHandlerStop()
 
         photos = list(getattr(msg, "photo", None) or [])
@@ -8296,38 +8344,89 @@ class TelegramAdapter(BasePlatformAdapter):
                 suffix = ".jpg"
         else:
             await self._mingli_console.image_chart_failure(user_id, chat_id, "image_download_failed")
+            self._mingli_console.complete_telegram_event(
+                event_id, "IMAGE_DOWNLOAD_FAILED"
+            )
             raise ApplicationHandlerStop()
 
         temp_path: str | None = None
         downloaded = False
+        image_hash: str | None = None
+        image_hash_claimed = False
+        event_status = "FAILED"
         try:
             file_obj = await source.get_file()
             descriptor, temp_path = tempfile.mkstemp(prefix="mingli-chart-", suffix=suffix)
             os.close(descriptor)
             await file_obj.download_to_drive(custom_path=temp_path)
             downloaded = True
+            image_bytes = _Path(temp_path).read_bytes()
+            image_hash = "sha256:" + hashlib.sha256(image_bytes).hexdigest()
+            if not self._mingli_console.claim_image_hash(
+                bot_id=bot_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                image_hash=image_hash,
+                event_id=event_id,
+            ):
+                event_status = "DUPLICATE_IMAGE"
+            else:
+                image_hash_claimed = True
+                from tools.vision_tools import vision_analyze_tool
 
-            from tools.vision_tools import vision_analyze_tool
-
-            provider_result = await asyncio.wait_for(
-                vision_analyze_tool(
-                    image_url=temp_path,
-                    user_prompt=_MINGLI_IMAGE_VISION_PROMPT,
-                ),
-                timeout=float(os.getenv("MINGLI_IMAGE_VISION_TIMEOUT", "30")),
-            )
-            provider_result = _normalize_mingli_image_provider_result(
-                provider_result
-            )
-            await self._mingli_console.image_chart(user_id, chat_id, provider_result)
+                vision_request_id = uuid.uuid4().hex
+                provider_result = await asyncio.wait_for(
+                    vision_analyze_tool(
+                        image_url=temp_path,
+                        user_prompt=_MINGLI_IMAGE_VISION_PROMPT,
+                    ),
+                    timeout=float(os.getenv("MINGLI_IMAGE_VISION_TIMEOUT", "30")),
+                )
+                provider_result = _normalize_mingli_image_provider_result(
+                    provider_result
+                )
+                await self._mingli_console.image_chart(
+                    user_id,
+                    chat_id,
+                    provider_result,
+                    bot_id=bot_id,
+                    update_id=getattr(update, "update_id", None),
+                    message_id=getattr(msg, "message_id", None),
+                    image_hash=image_hash,
+                    vision_provider="hermes.vision_analyze_tool",
+                    vision_request_id=vision_request_id,
+                )
+                event_status = "COMPLETED"
         except asyncio.TimeoutError:
+            event_status = "VISION_TIMEOUT"
             logger.warning("MingLi image vision timed out")
             await self._mingli_console.image_chart_failure(user_id, chat_id, "provider_missing")
         except Exception as exc:
             status = "provider_missing" if downloaded else "image_download_failed"
+            event_status = (
+                "VISION_FAILED" if downloaded else "IMAGE_DOWNLOAD_FAILED"
+            )
             logger.warning("MingLi image intake failed: %s", type(exc).__name__)
             await self._mingli_console.image_chart_failure(user_id, chat_id, status)
         finally:
+            if (
+                image_hash_claimed
+                and image_hash is not None
+                and event_status in {"VISION_FAILED", "VISION_TIMEOUT"}
+            ):
+                try:
+                    self._mingli_console.release_image_hash(
+                        bot_id=bot_id,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        image_hash=image_hash,
+                        event_id=event_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "MingLi image hash release failed: %s",
+                        type(exc).__name__,
+                    )
             if temp_path:
                 try:
                     os.remove(temp_path)
@@ -8335,6 +8434,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
                 except OSError as exc:
                     logger.warning("MingLi image temporary-file cleanup failed: %s", type(exc).__name__)
+            self._mingli_console.complete_telegram_event(event_id, event_status)
         raise ApplicationHandlerStop()
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
