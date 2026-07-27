@@ -57,6 +57,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Checkout pinned MingLi baseline
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: mqpmqp/mingli-agent
+          ref: 9416f63c9ccb9dcd58e5ec3d14e4e20a0a995670
+          path: mingli-agent-ci
+          persist-credentials: false
+
       - name: Install ripgrep (prebuilt binary)
         run: |
           set -euo pipefail
@@ -119,6 +127,8 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+          MINGLI_REPO: ${{ github.workspace }}/mingli-agent-ci
+          MINGLI_COMMIT_SHA: 9416f63c9ccb9dcd58e5ec3d14e4e20a0a995670
 
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
