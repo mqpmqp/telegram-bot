@@ -27,6 +27,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # The image-chain tests import the parser from the separately-owned
+      # MingLi runtime. Keep the dependency explicit and immutable; do not
+      # copy MingLi implementation into this repository.
+      - name: Checkout MingLi runtime dependency
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: mqpmqp/mingli-agent
+          ref: 129ebd09df5c924cc4466e58271938f9b9a19875
+          path: mingli-agent
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Restore duration cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -119,6 +131,8 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+          MINGLI_REPO: ${{ github.workspace }}/mingli-agent
+          MINGLI_COMMIT_SHA: 129ebd09df5c924cc4466e58271938f9b9a19875
 
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
