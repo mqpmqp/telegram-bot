@@ -58,6 +58,10 @@ _INFRA_JOBS = frozenset({
     "CI review comment (live)",
     "All required checks pass",
     "Detect affected areas",
+    # The label gate is the sole manual approval boundary. Its structured
+    # review status remains in the comment, but its expected missing-label
+    # failure must not make this best-effort comment publisher fail too.
+    "Review label gate / Review label gate",
 })
 
 # Map GitHub API conclusion values to our result strings.
