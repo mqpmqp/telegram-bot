@@ -47,6 +47,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(self.arun(self.console.command("42", "c", "/start")))
         self.assertIn("MingLi 命理师控制台", self.sent[-1][1])
 
+    def test_non_admin_plain_text_is_not_claimed_but_mingli_text_is_denied(self):
+        self.assertFalse(self.arun(self.console.confirm("7", "c", "ordinary chat")))
+        self.assertFalse(self.arun(self.console.text("7", "c", "ordinary chat")))
+        self.assertEqual([], self.sent)
+
+        for explicit_mingli_text in (
+            "请帮我看八字",
+            "我的四柱是甲子乙丑丙寅丁卯",
+            "出生资料是 1990-01-01 10:30",
+        ):
+            with self.subTest(text=explicit_mingli_text):
+                self.assertTrue(
+                    self.arun(
+                        self.console.confirm("7", "c", explicit_mingli_text)
+                    )
+                )
+                self.assertIn("内部工作控制台", self.sent[-1][1])
+
     def test_new_state_missing_and_cancel(self):
         self.assertTrue(self.arun(self.console.command("42", "c", "/new")))
         self.assertTrue(self.arun(self.console.text("42", "c", "案例A")))
