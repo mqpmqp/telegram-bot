@@ -90,7 +90,7 @@ def test_classify_mixed():
 
 
 def test_classify_infra_jobs_excluded():
-    """Infra jobs (detect, all-checks-pass, comment-live) are never shown."""
+    """Infrastructure and manual-gate jobs are never treated as technical failures."""
     jobs = [
         _job("detect", "completed", "success"),
         _job("Detect affected areas", "completed", "success"),
@@ -98,6 +98,7 @@ def test_classify_infra_jobs_excluded():
         _job("All required checks pass", "completed", "success"),
         _job("comment-live", "in_progress", None),
         _job("CI review comment (live)", "in_progress", None),
+        _job("Review label gate", "completed", "failure", workflow="Review label gate"),
         _job("Python tests", "completed", "success"),
     ]
     completed, pending, job_urls = _mod.classify_jobs(jobs)
