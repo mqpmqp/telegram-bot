@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from mingli_console.image_reliability_store import ImageReliabilityStore
+from mingli_console.knowledge import (
+    KnowledgeReferenceClient,
+    render_reviewed_references,
+    reviewed_references_only,
+)
 
 log = logging.getLogger(__name__)
 DISCLAIMER = "仅供文化研究与娱乐参考。"
@@ -240,13 +245,20 @@ class MingLiRuntimeAdapter:
 
 class MingLiConsole:
     """Telegram-facing state machine. Transport is injected for testability."""
-    def __init__(self, send: Callable[[str, str], Awaitable[None]], db_path: str | None = None, runtime: MingLiRuntimeAdapter | None = None):
+    def __init__(
+        self,
+        send: Callable[[str, str], Awaitable[None]],
+        db_path: str | None = None,
+        runtime: MingLiRuntimeAdapter | None = None,
+        knowledge_client: KnowledgeReferenceClient | None = None,
+    ):
         self.send = send
         self.sessions: dict[object, Session] = {}
         self.completed: dict[str, dict[str, Any]] = {}
         self.repo = CaseRepository(db_path)
         self.image_store = ImageReliabilityStore(self.repo.path)
         self.runtime = runtime or MingLiRuntimeAdapter()
+        self.knowledge_client = knowledge_client or KnowledgeReferenceClient()
         self._restore_image_sessions()
 
     @staticmethod
@@ -791,6 +803,18 @@ class MingLiConsole:
             log.warning("MingLi runtime failed: %s", type(exc).__name__)
             return None
 
+    async def _append_reviewed_references(
+        self, answer: str, topic: object, *, limit: int | None = None
+    ) -> str:
+        """Query only after a routed text answer exists; failures leave it unchanged."""
+
+        query = str(topic).strip()
+        if not query:
+            return answer
+        references = await asyncio.to_thread(self.knowledge_client.search, query)
+        rendered = answer + render_reviewed_references(reviewed_references_only(references))
+        return rendered if limit is None or len(rendered) <= limit else answer
+
     @staticmethod
     def _scenario_for(topic: str) -> str | None:
         if topic in {"考公考编", "考公", "考编"}: return "career_exam"
@@ -820,6 +844,9 @@ class MingLiConsole:
         rendered = str(result.get("final_answer", ""))
         compressed = "\n".join(line for line in rendered.splitlines() if line.strip())
         compressed = compressed[:max(0, limit - len(DISCLAIMER) - 1)].rstrip() + "\n" + DISCLAIMER
+        compressed = await self._append_reviewed_references(
+            compressed, session.data.get("topic"), limit=limit
+        )
         await self._reply(chat_id, compressed); return True
 
     async def text(self, user_id: str, chat_id: str, text: str) -> bool:
@@ -869,7 +896,11 @@ class MingLiConsole:
             extra = self._scenario_text(result, topic)
             if topic not in {"事业", "财运", "感情", "考公考编", "复合"}:
                 extra = f"\n专项状态：unsupported。固定 SHA 当前专项场景仅支持 career_exam、relationship_reunion；本主题仅返回基础 Runtime 结果。"
-            await self._reply(chat_id, str(result.get("final_answer", "")) + extra + ("\n" if extra else "") + DISCLAIMER)
+            answer = str(result.get("final_answer", "")) + extra + ("\n" if extra else "") + DISCLAIMER
+            await self._reply(
+                chat_id,
+                await self._append_reviewed_references(answer, topic),
+            )
             session.step = "done"; return True
         return False
 
