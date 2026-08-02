@@ -122,8 +122,9 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("unsupported", self.sent[-1][1])
 
     def test_runtime_schema_error_and_lunar_flag(self):
-        from mingli_console.console import MingLiRuntimeAdapter
+        from mingli_console.console import FIXED_MINGLI_SHA, MingLiRuntimeAdapter
         adapter = MingLiRuntimeAdapter()
+        self.assertEqual("129ebd09df5c924cc4466e58271938f9b9a19875", FIXED_MINGLI_SHA)
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male"}, "anchor_year": 2026})
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male", "calendar": "lunar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {}, "true_solar_time": False}, "anchor_year": 2026})
 
