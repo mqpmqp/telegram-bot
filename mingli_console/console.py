@@ -26,7 +26,7 @@ from mingli_console.knowledge import (
 
 log = logging.getLogger(__name__)
 DISCLAIMER = "仅供文化研究与娱乐参考。"
-FIXED_MINGLI_SHA = "1b93df7f1256d0701f299a882a17052ad37513d8"
+FIXED_MINGLI_SHA = "129ebd09df5c924cc4466e58271938f9b9a19875"
 MAX_TELEGRAM_TEXT = 4096
 IMAGE_CONFIRM_TTL_SECONDS = 15 * 60
 PILLAR_ORDER = ("year", "month", "day", "hour")

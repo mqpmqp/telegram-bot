@@ -6,7 +6,7 @@
 - 分支：`feature/hermes-telegram-mingli-console-v1`
 - 当前 commit：以 `git rev-parse HEAD` 为准（本文件随该本地提交保存）
 - 基线 HEAD（修改前）：`e598cef87465981fcea1c0339edfcf5d9716c917`
-- MingLi 固定 SHA：`1b93df7f1256d0701f299a882a17052ad37513d8`
+- MingLi 固定 SHA：`129ebd09df5c924cc4466e58271938f9b9a19875`
 
 本文件随本地功能提交保存。提交后以 `git rev-parse HEAD` 作为当前 Hermes commit。
 
