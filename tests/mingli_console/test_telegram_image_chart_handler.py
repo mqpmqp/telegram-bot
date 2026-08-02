@@ -31,6 +31,15 @@ class FakeRuntime:
         return {"final_answer": "图片命盘结果\n仅供文化研究与娱乐参考。"}
 
 
+class FakeKnowledge:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def search(self, query: str) -> list[dict]:
+        self.calls.append(query)
+        return []
+
+
 class FakeFile:
     _sequence = 0
 
@@ -103,7 +112,13 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
             self.sent.append((chat_id, text))
 
         self.runtime = FakeRuntime()
-        self.console = MingLiConsole(send, str(Path(self.tmp.name) / "cases.sqlite3"), self.runtime)
+        self.knowledge = FakeKnowledge()
+        self.console = MingLiConsole(
+            send,
+            str(Path(self.tmp.name) / "cases.sqlite3"),
+            self.runtime,
+            self.knowledge,
+        )
         self.adapter = object.__new__(telegram_adapter.TelegramAdapter)
         self.adapter._mingli_console = self.console
         self.adapter._bot = SimpleNamespace(id=999)
@@ -129,6 +144,7 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
         chat_id: str = "chat",
         photos: list[FakeMedia] | None = None,
         document: FakeMedia | None = None,
+        voice: object | None = None,
         text: str | None = None,
         update_id: int | None = None,
         message_id: int | None = None,
@@ -144,6 +160,7 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
             chat=SimpleNamespace(id=chat_id, type="private"),
             photo=photos or [],
             document=document,
+            voice=voice,
             text=text,
             message_id=message_id,
         )
@@ -208,6 +225,17 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
 
         self.assertEqual(1, document.get_file_calls)
         self.assertFalse(Path(file_obj.download_paths[0]).exists())
+        self.assertEqual([], self.knowledge.calls)
+        self.assertEqual([], self.runtime.calls)
+
+    def test_voice_media_never_searches_knowledge(self) -> None:
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(
+                self.adapter._handle_mingli_media(
+                    self.update_for(voice=object()), None
+                )
+            )
+        self.assertEqual([], self.knowledge.calls)
         self.assertEqual([], self.runtime.calls)
 
     def test_download_failure_returns_safe_fallback_without_provider_call(self) -> None:
