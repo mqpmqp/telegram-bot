@@ -205,21 +205,25 @@ jobs:
           COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
           COMMIT_MESSAGE: ${{ github.event.pull_request.head.commit.message }}
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}/commits/${{ github.event.pull_request.head.sha }}
-          # Structured review statuses from workflow_call jobs.
-          # Each job outputs a JSON array of {source, results: [...]} objects
-          # that the assembler renders directly — no hardcoded job-name
-          # matching. We merge all available outputs into one array.
-          REVIEW_STATUSES: ${{ toJSON(needs.*.outputs.review_status) }}
         run: |
           set -uo pipefail
 
-          # REVIEW_STATUSES is a JSON array of strings (some may be empty
-          # when a job was skipped). Parse each string and merge into one
-          # flat array for the assembler.
-          python3 - <<'PYEOF'
-          import json, os, sys
+          # Keep large review payloads out of the process environment. A
+          # lockfile review can legitimately exceed ARG_MAX once Actions adds
+          # the environment for bash; a quoted heredoc preserves the exact
+          # JSON without suppressing any review finding.
+          cat > /tmp/review_statuses_raw.json <<'JSONEOF'
+          ${{ toJSON(needs.*.outputs.review_status) }}
+          JSONEOF
 
-          raw = os.environ.get("REVIEW_STATUSES", "")
+          # The raw file is a JSON array of strings (some may be empty when a
+          # job was skipped). Parse each string and merge into one flat array
+          # for the assembler.
+          python3 - <<'PYEOF'
+          import json
+          from pathlib import Path
+
+          raw = Path("/tmp/review_statuses_raw.json").read_text(encoding="utf-8")
           merged = []
           if raw:
               try:
