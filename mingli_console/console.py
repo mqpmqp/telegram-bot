@@ -418,6 +418,40 @@ class MingLiConsole:
         return True
 
     @staticmethod
+    def _is_explicit_mingli_text(text: str) -> bool:
+        """Return whether free text is explicitly addressed to the MingLi console.
+
+        The Telegram text handler runs before Hermes's general text route.  It
+        must therefore leave ordinary non-admin conversation unhandled while
+        still refusing an unmistakable attempt to use the internal MingLi
+        console.
+        """
+        normalized = text.strip()
+        if normalized in {
+            "新客户完整测算",
+            "评论区快速回复",
+            "专项问题分析",
+            "历史案例",
+            "取消当前任务",
+        }:
+            return True
+        return any(
+            keyword in normalized
+            for keyword in (
+                "八字",
+                "四柱",
+                "命盘",
+                "排盘",
+                "命理",
+                "出生资料",
+                "出生日期",
+                "出生时间",
+                "生辰",
+                "日主",
+            )
+        )
+
+    @staticmethod
     def _menu() -> str:
         return "🔮 MingLi 命理师控制台\n\n请选择：\n\n【新客户完整测算】 /new\n【评论区快速回复】 /quick\n【专项问题分析】 /analyze\n【历史案例】 /history\n【取消当前任务】 /cancel\n\n/help 查看帮助"
 
@@ -851,7 +885,9 @@ class MingLiConsole:
 
     async def text(self, user_id: str, chat_id: str, text: str) -> bool:
         if not is_admin(user_id):
-            return await self._deny(chat_id)
+            if self._is_explicit_mingli_text(text):
+                return await self._deny(chat_id)
+            return False
         image_session = self._image_session(user_id, chat_id)
         session = image_session or self.sessions.get(str(user_id))
         if not session:
@@ -918,7 +954,10 @@ class MingLiConsole:
         session.step = "confirm"; return True
 
     async def confirm(self, user_id: str, chat_id: str, text: str) -> bool:
-        if not is_admin(user_id): return await self._deny(chat_id)
+        if not is_admin(user_id):
+            if self._is_explicit_mingli_text(text):
+                return await self._deny(chat_id)
+            return False
         image_session = self._image_session(user_id, chat_id)
         if image_session and image_session.step in {"awaiting_confirmation", "awaiting_gender"}:
             return await self._confirm_image_candidate(user_id, chat_id, image_session, text)
