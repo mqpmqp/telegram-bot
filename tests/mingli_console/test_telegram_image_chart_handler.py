@@ -431,14 +431,31 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
         self.assertNotIn(("chat", "7"), self.console.sessions)
         self.assertIn("暂未开放", self.sent[-1][1])
 
-    def test_console_messages_are_consumed_but_ordinary_text_propagates(self) -> None:
+    def test_console_messages_are_consumed_but_non_admin_ordinary_text_propagates(self) -> None:
         command_update = self.update_for(text="/new")
         with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
             self.arun(self.adapter._handle_mingli_command(command_update, None))
         self.assertEqual("new", self.console.sessions["42"].mode)
 
         self.console.sessions.clear()
-        self.assertIsNone(self.arun(self.adapter._handle_mingli_text(self.update_for(text="ordinary chat"), None)))
+        sent_before = list(self.sent)
+        self.assertIsNone(
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(user_id="7", text="ordinary chat"), None
+                )
+            )
+        )
+        self.assertEqual(sent_before, self.sent)
+
+    def test_non_admin_explicit_mingli_text_is_rejected(self) -> None:
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(user_id="7", text="请帮我看四柱"), None
+                )
+            )
+        self.assertIn("内部工作控制台", self.sent[-1][1])
 
     def test_existing_commands_and_image_confirmation_route_through_early_handlers(self) -> None:
         for command in ("/new", "/quick", "/analyze", "/history", "/cancel"):
