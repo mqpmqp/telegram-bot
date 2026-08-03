@@ -465,6 +465,12 @@ class MingLiConsole:
         lower = text.casefold()
 
         gender = re.search(r"性别\s*[:：]?\s*(男|女|male|female)\b", text, re.I)
+        if gender is None:
+            gender = re.search(
+                r"(?:^|[：:\s，,；;])\s*(男|女|male|female)(?=$|[\s，,；;])",
+                text,
+                re.I,
+            )
         if gender:
             chart["gender"] = "female" if gender.group(1).casefold() in {"女", "female"} else "male"
 
