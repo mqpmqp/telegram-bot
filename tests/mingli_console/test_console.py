@@ -116,6 +116,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(1, len(self.runtime.calls))
         self.assertIn("42", self.console.completed)
 
+    def test_admin_lunar_birth_text_accepts_explicit_unlabelled_gender(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "八字：女，农历，闰月：是，出生日期：1990-01-01，"
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual(1, len(self.runtime.calls))
+        chart = self.runtime.calls[0]["chart_input"]
+        self.assertEqual("female", chart["gender"])
+        self.assertEqual("lunar", chart["calendar"])
+        self.assertTrue(chart["is_leap_month"])
+
     def test_admin_birth_text_rejects_invalid_date_without_runtime(self):
         self.assertTrue(
             self.arun(
