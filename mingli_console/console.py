@@ -435,7 +435,7 @@ class MingLiConsole:
             "取消当前任务",
         }:
             return True
-        return any(
+        if any(
             keyword in normalized
             for keyword in (
                 "八字",
@@ -449,7 +449,193 @@ class MingLiConsole:
                 "生辰",
                 "日主",
             )
+        ):
+            return True
+        return bool(
+            re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", normalized)
+            and re.search(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", normalized)
         )
+
+    @staticmethod
+    def _text_intake_updates(text: str) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Parse only explicit, user-provided birth fields; never infer them."""
+
+        chart: dict[str, Any] = {}
+        invalid: list[str] = []
+        lower = text.casefold()
+
+        gender = re.search(r"性别\s*[:：]?\s*(男|女|male|female)\b", text, re.I)
+        if gender:
+            chart["gender"] = "female" if gender.group(1).casefold() in {"女", "female"} else "male"
+
+        if "农历" in text:
+            chart["calendar"] = "lunar"
+        elif "公历" in text or "阳历" in text:
+            chart["calendar"] = "solar"
+
+        leap = re.search(r"(?:是否)?闰月\s*[:：]?\s*(是|否|true|false|闰|非闰)", text, re.I)
+        if leap:
+            chart["is_leap_month"] = leap.group(1).casefold() in {"是", "true", "闰"}
+
+        date_match = re.search(
+            r"(?:出生日期|生日|日期)\s*[:：]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+            text,
+        ) or re.search(r"\b(\d{4}-\d{1,2}-\d{1,2})\b", text)
+        if date_match:
+            raw_date = date_match.group(1).replace("/", "-")
+            try:
+                chart["birth_date"] = datetime.strptime(raw_date, "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                invalid.append("出生日期")
+
+        time_match = re.search(r"(?:出生时间|时间)\s*[:：]?\s*(\d{1,2}:\d{2})", text) or re.search(
+            r"(?<!\d)(\d{1,2}:\d{2})(?!\d)", text
+        )
+        if time_match:
+            raw_time = time_match.group(1)
+            try:
+                chart["birth_time"] = datetime.strptime(raw_time, "%H:%M").strftime("%H:%M")
+            except ValueError:
+                invalid.append("出生时间")
+
+        location = re.search(r"(?:出生地|出生地点|地点)\s*[:：]?\s*([^，,；;\n]+)", text)
+        if location:
+            value = location.group(1).strip()
+            if value:
+                chart["birth_location"] = value
+            else:
+                invalid.append("出生地")
+
+        timezone_match = re.search(r"(?:时区|timezone)\s*[:：]?\s*([A-Za-z_]+/[A-Za-z_+\-]+)", text, re.I)
+        if timezone_match:
+            chart["timezone"] = timezone_match.group(1)
+        elif "时区" in text or "timezone" in lower:
+            invalid.append("时区")
+
+        solar = re.search(r"真太阳时\s*[:：]?\s*(是|否|true|false)", text, re.I)
+        if solar:
+            chart["true_solar_time"] = solar.group(1).casefold() in {"是", "true"}
+
+        return chart, tuple(dict.fromkeys(invalid))
+
+    @staticmethod
+    def _text_intake_missing(chart: Mapping[str, Any]) -> list[str]:
+        labels = {
+            "gender": "性别",
+            "calendar": "公历/农历",
+            "birth_date": "出生日期",
+            "birth_time": "出生时间",
+            "birth_location": "出生地",
+            "timezone": "时区",
+            "true_solar_time": "是否采用真太阳时",
+        }
+        missing = [label for key, label in labels.items() if chart.get(key) in (None, "")]
+        if chart.get("calendar") == "lunar" and chart.get("is_leap_month") is None:
+            missing.append("农历是否闰月")
+        if chart.get("true_solar_time") is True:
+            location = str(chart.get("birth_location", ""))
+            parts = [part.strip() for part in location.split(",")]
+            try:
+                valid_coordinates = len(parts) >= 3 and all(
+                    isinstance(float(value), float) for value in parts[:2]
+                )
+            except ValueError:
+                valid_coordinates = False
+            if not valid_coordinates:
+                missing.append("出生地经纬度")
+        return missing
+
+    @staticmethod
+    def _text_intake_location(chart: Mapping[str, Any]) -> dict[str, Any]:
+        location = str(chart["birth_location"]).strip()
+        if not chart["true_solar_time"]:
+            return {"city": location}
+        longitude, latitude, *city = [part.strip() for part in location.split(",")]
+        return {
+            "longitude": float(longitude),
+            "latitude": float(latitude),
+            "city": ",".join(city),
+        }
+
+    async def _complete_text_intake(
+        self, user_id: str, chat_id: str, session: Session, text: str
+    ) -> bool:
+        updates, invalid = self._text_intake_updates(text)
+        chart = session.data.setdefault("chart", {})
+        chart.update(updates)
+        if chart.get("calendar") == "solar":
+            chart["is_leap_month"] = False
+
+        if invalid:
+            await self._reply(
+                chat_id,
+                "资料校验失败：" + "、".join(invalid) + "无效，请仅更正这些字段。",
+            )
+            return True
+
+        missing = self._text_intake_missing(chart)
+        if missing:
+            await self._reply(
+                chat_id,
+                "资料尚不完整，缺少：" + "、".join(missing) + "。请只补充缺少字段。",
+            )
+            return True
+
+        normalized_chart = {
+            "gender": chart["gender"],
+            "calendar": chart["calendar"],
+            "is_leap_month": bool(chart["is_leap_month"]),
+            "birth_date": chart["birth_date"],
+            "birth_time": chart["birth_time"],
+            "timezone": chart["timezone"],
+            "birth_location": self._text_intake_location(chart),
+            "true_solar_time": bool(chart["true_solar_time"]),
+        }
+        payload = self._payload_from_chart(normalized_chart, "")
+        result = await self._run(payload)
+        if result is None:
+            await self._reply(chat_id, "MingLi Runtime 当前不可用或资料不符合接口要求；请检查出生资料后重试。")
+            return True
+
+        final = str(result["final_answer"])
+        if not final.endswith(DISCLAIMER):
+            final += "\n" + DISCLAIMER
+        await self._reply(chat_id, final)
+        now = datetime.now(timezone.utc).isoformat()
+        case_id = "case-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        case = {
+            "case_id": case_id,
+            "customer_id": str(user_id),
+            "display_name": str(user_id),
+            "gender": normalized_chart["gender"],
+            "calendar_type": normalized_chart["calendar"],
+            "birth_datetime": normalized_chart["birth_date"] + " " + normalized_chart["birth_time"],
+            "birth_location": normalized_chart["birth_location"],
+            "true_solar_time_policy": normalized_chart["true_solar_time"],
+            "topic": "综合",
+            "reality_context": "",
+            "normalized_input": payload,
+            "mingli_commit_sha": self.runtime.commit_sha,
+            "runtime_version": result.get("calculation_version"),
+            "result": final,
+            "confidence": "low",
+            "created_at": now,
+            "updated_at": now,
+            "status": "completed",
+        }
+        try:
+            self.repo.save(case)
+        except Exception:
+            log.warning("case save failed: %s", type(sys.exc_info()[1]).__name__)
+        self.completed[str(user_id)] = {
+            "chart": normalized_chart,
+            "case_id": case_id,
+            "topic": "综合",
+            "reality_context": "",
+        }
+        session.data["active_case_id"] = case_id
+        session.step = "done"
+        return True
 
     @staticmethod
     def _menu() -> str:
@@ -894,6 +1080,10 @@ class MingLiConsole:
             if text.strip() in {"新客户完整测算", "评论区快速回复", "专项问题分析", "历史案例", "取消当前任务"}:
                 aliases = {"新客户完整测算": "/new", "评论区快速回复": "/quick", "专项问题分析": "/analyze", "历史案例": "/history", "取消当前任务": "/cancel"}
                 return await self.command(user_id, chat_id, aliases[text.strip()])
+            if self._is_explicit_mingli_text(text):
+                session = Session("text_intake", step="collecting", data={"chart": {}})
+                self.sessions[str(user_id)] = session
+                return await self._complete_text_intake(user_id, chat_id, session, text)
             return False
         if text.strip().lower() == "/cancel":
             return await self.command(user_id, chat_id, text)
@@ -906,6 +1096,10 @@ class MingLiConsole:
                 return False
         if image_session is not None and image_session.step in {"awaiting_confirmation", "awaiting_gender"}:
             return await self._confirm_image_candidate(user_id, chat_id, image_session, text)
+        if session.mode == "text_intake":
+            if session.step == "done":
+                return False
+            return await self._complete_text_intake(user_id, chat_id, session, text)
         if session.mode == "new":
             return await self._new_step(user_id, chat_id, session, text.strip())
         if session.mode == "quick":
