@@ -176,6 +176,40 @@ class RenderIntentRoutingTests(unittest.TestCase):
         self.assertEqual("继续看财运", question)
         self.assertIn("follow_up:继续看财运", self.sent[-1][1])
 
+    def test_active_full_case_focused_question_uses_saved_runtime_artifacts(self) -> None:
+        self.console.completed["42"] = {
+            "mode": "full",
+            "case_id": "case-full",
+            "chart": self.chart(),
+            "runtime_result": self.runtime.full({}),
+        }
+        self.runtime.full_calls.clear()
+
+        self.assertTrue(self.arun(self.console.text("42", "chat", "只看财运")))
+
+        self.assertEqual([], self.runtime.full_calls)
+        self.assertEqual(1, len(self.runtime.render_calls))
+        _, intent, question = self.runtime.render_calls[0]
+        self.assertEqual("focused_question", intent)
+        self.assertEqual("只看财运", question)
+        self.assertIn("focused_question:只看财运", self.sent[-1][1])
+
+    def test_non_admin_focused_question_is_denied_without_runtime(self) -> None:
+        self.assertTrue(self.arun(self.console.text("43", "chat", "只看财运")))
+
+        self.assertEqual([], self.runtime.full_calls)
+        self.assertEqual([], self.runtime.text_confirmed_calls)
+        self.assertEqual([], self.runtime.render_calls)
+        self.assertIn("暂未开放使用", self.sent[-1][1])
+
+    def test_focused_question_without_active_case_is_consumed_without_runtime(self) -> None:
+        self.assertTrue(self.arun(self.console.text("42", "chat", "只看财运")))
+
+        self.assertEqual([], self.runtime.full_calls)
+        self.assertEqual([], self.runtime.text_confirmed_calls)
+        self.assertEqual([], self.runtime.render_calls)
+        self.assertIn("没有已完成的 MingLi 案例", self.sent[-1][1])
+
     def test_completed_birth_text_routes_follow_up_without_new_runtime(self) -> None:
         message = (
             "请看八字：性别：男，公历，出生日期：1990-01-01，"

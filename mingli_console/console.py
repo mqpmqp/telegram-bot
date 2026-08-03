@@ -649,6 +649,8 @@ class MingLiConsole:
             return True
         if len(re.findall(r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]", normalized)) >= 4:
             return True
+        if MingLiConsole._active_case_intent(normalized) is not None:
+            return True
         return bool(
             re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", normalized)
             and re.search(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", normalized)
@@ -1011,19 +1013,31 @@ class MingLiConsole:
         return True
 
     @staticmethod
-    def _is_active_case_follow_up(text: str) -> bool:
+    def _active_case_intent(text: str) -> str | None:
         continuation = ("继续看", "再看", "那", "还有")
         topics = ("事业", "财运", "感情", "考公", "考编", "复合")
-        return any(token in text for token in continuation) and any(
+        if any(token in text for token in continuation) and any(
             topic in text for topic in topics
-        )
+        ):
+            return "follow_up"
+        if re.search(
+            r"(?:^|[，。；、\s])(?:只看|只想看|单看)\s*(?:事业|财运|感情|考公|考编|复合)",
+            text,
+        ):
+            return "focused_question"
+        return None
 
     async def _active_case_follow_up(
-        self, user_id: str, chat_id: str, question: str
+        self, user_id: str, chat_id: str, question: str, *, intent: str
     ) -> bool:
         active = self.completed.get(str(user_id))
         if not active:
-            return False
+            await self._reply(
+                chat_id,
+                "没有已完成的 MingLi 案例可供此问题使用；请先完成一次完整出生资料分析。\n"
+                + DISCLAIMER,
+            )
+            return True
         runtime_result = active.get("runtime_result")
         if not isinstance(runtime_result, Mapping):
             await self._reply(
@@ -1040,7 +1054,7 @@ class MingLiConsole:
                 rendered = await asyncio.to_thread(
                     self.runtime.render_intent,
                     runtime_result,
-                    intent="follow_up",
+                    intent=intent,
                     question=question,
                 )
         except Exception as exc:
@@ -1599,8 +1613,11 @@ class MingLiConsole:
             if self._is_explicit_mingli_text(text):
                 return await self._deny(chat_id)
             return False
-        if self._is_active_case_follow_up(text):
-            return await self._active_case_follow_up(user_id, chat_id, text)
+        active_case_intent = self._active_case_intent(text)
+        if active_case_intent is not None:
+            return await self._active_case_follow_up(
+                user_id, chat_id, text, intent=active_case_intent
+            )
         image_session = self._image_session(user_id, chat_id)
         session = image_session or self.sessions.get(str(user_id))
         if not session:
