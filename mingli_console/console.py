@@ -230,7 +230,23 @@ class MingLiRuntimeAdapter:
             raise ValueError("confirmed image chart metadata invalid")
         if any(candidate.get(name) is not None for name in ("birth_datetime", "birth_place", "calendar_type")):
             raise ValueError("image chart confirmation contains inferred birth data")
-        result = self._mingli_confirmed({"pillars": normalized, "day_master": normalized["day"][0], "gender": candidate["gender"], "source": "image_confirmed", "confirmation_status": "confirmed"}).to_dict()
+        trace_id = payload.get("trace_id")
+        idempotency_key = payload.get("idempotency_key")
+        if not isinstance(trace_id, str) or not trace_id.strip():
+            raise ValueError("confirmed image trace_id is required")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("confirmed image idempotency_key is required")
+        result = self._mingli_confirmed(
+            {
+                "pillars": normalized,
+                "day_master": normalized["day"][0],
+                "gender": candidate["gender"],
+                "source": "image_confirmed",
+                "confirmation_status": "confirmed",
+                "trace_id": trace_id,
+                "idempotency_key": idempotency_key,
+            }
+        ).to_dict()
         chart = result.get("chart") if isinstance(result, Mapping) else None
         if not isinstance(result.get("final_answer"), str) or not result["final_answer"].strip() or not isinstance(chart, Mapping):
             raise RuntimeErrorBase("runtime output schema invalid")
