@@ -12,6 +12,7 @@ class FakeRuntime:
 
     def __init__(self):
         self.calls = []
+        self.render_calls = []
 
     def full(self, payload):
         self.calls.append(payload)
@@ -21,6 +22,23 @@ class FakeRuntime:
         if payload.get("scenario") == "relationship_reunion":
             layers = [{"layer": x, "label": "conditional", "confidence": "medium"} for x in ["attraction", "recontact", "reunion", "stability"]]
         return {"final_answer": "1. 资料确认\n2. 称骨歌诀\n3. 结论\n4. 事业\n5. 财运\n6. 感情\n7. 五年断事\n8. 建议\n仅供文化研究与娱乐参考。", "calculation_version": "test", "scenario_assessment": {"layers": layers}}
+    def render_intent(self, result, *, intent, question):
+        self.render_calls.append((result, intent, question))
+        layers = result.get("scenario_assessment", {}).get("layers", [])
+        names = {item.get("layer") for item in layers}
+        if "system_fit" in names:
+            answer = "适合体制内与否：需要结合现实条件。"
+        elif "attraction" in names:
+            answer = "缘分牵引：需要结合现实条件。"
+        elif intent == "comment":
+            answer = "事业：请结合现实条件判断。"
+            supported = True
+        else:
+            answer = "当前问题不在正式支持范围。"
+            supported = False
+        if "system_fit" in names or "attraction" in names:
+            supported = True
+        return {"final_answer": answer + "\n仅供文化研究与娱乐参考。", "supported": supported}
 
 
 class ConsoleTests(unittest.TestCase):
@@ -222,7 +240,7 @@ class ConsoleTests(unittest.TestCase):
             else: os.environ["MINGLI_RUNTIME_TIMEOUT"] = old
         self.console.completed["42"] = {"chart": {"gender": "male", "calendar": "solar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {"city": "福州"}, "true_solar_time": False}}
         self.arun(self.console.command("42", "c", "/analyze")); self.arun(self.console.text("42", "c", "学业")); self.arun(self.console.text("42", "c", "现实"))
-        self.assertIn("unsupported", self.sent[-1][1])
+        self.assertIn("正式支持范围", self.sent[-1][1])
 
     def test_runtime_schema_error_and_lunar_flag(self):
         from mingli_console.console import FIXED_MINGLI_SHA, MingLiRuntimeAdapter

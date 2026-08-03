@@ -643,3 +643,11 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
         self.assertTrue(audit["runtime_called_at"])
         self.assertTrue(audit["runtime_result_hash"])
         self.assertEqual("COMPLETED", audit["status"])
+        active = self.console.completed["42"]
+        self.assertEqual("confirmed_pillars", active["mode"])
+        self.assertEqual("image_confirmed", active["source"])
+        self.assertEqual(session.data["trace_id"], active["trace_id"])
+        self.assertEqual("丙寅", active["confirmed_pillars"]["day"])
+        self.assertTrue(active["runtime_result_hash"])
+        self.assertTrue(active["case_id"])
+        self.assertEqual([], self.knowledge.calls)

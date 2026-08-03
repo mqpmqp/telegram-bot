@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterator, Mapping
 
 from mingli_console.image_reliability_store import ImageReliabilityStore
@@ -27,6 +30,8 @@ from mingli_console.knowledge import (
 log = logging.getLogger(__name__)
 DISCLAIMER = "仅供文化研究与娱乐参考。"
 FIXED_MINGLI_SHA = "129ebd09df5c924cc4466e58271938f9b9a19875"
+MINGLI_RENDER_REPO_ENV = "MINGLI_RENDER_REPO"
+MINGLI_RENDER_COMMIT_SHA_ENV = "MINGLI_RENDER_COMMIT_SHA"
 MAX_TELEGRAM_TEXT = 4096
 IMAGE_CONFIRM_TTL_SECONDS = 15 * 60
 PILLAR_ORDER = ("year", "month", "day", "hour")
@@ -147,10 +152,18 @@ class MingLiRuntimeAdapter:
     def __init__(self, repo: str | None = None, expected_sha: str = FIXED_MINGLI_SHA):
         self.repo = Path(repo or os.getenv("MINGLI_REPO", "/root/mingli-agent")).resolve()
         self.expected_sha = os.getenv("MINGLI_COMMIT_SHA", expected_sha)
+        render_repo = os.getenv(MINGLI_RENDER_REPO_ENV)
+        self.render_repo = Path(render_repo).expanduser().resolve() if render_repo else None
+        self.render_expected_sha = os.getenv(MINGLI_RENDER_COMMIT_SHA_ENV, "")
         self._ready = False
         self._mingli = None
         self._mingli_confirmed = None
         self._engine = None
+        self._render_ready = False
+        self._render_intent = None
+        self._render_intent_enum = None
+        self._render_confirmed = None
+        self._render_confirmed_follow_up = None
 
     def _prepare(self) -> None:
         if self._ready:
@@ -175,6 +188,173 @@ class MingLiRuntimeAdapter:
         self._engine, self._mingli = DeterministicBaziEngine, run_mingli_agent
         self._mingli_confirmed = run_confirmed_pillar_agent
         self._ready = True
+
+    def _prepare_render_intent(self) -> None:
+        """Load a separately pinned render extension without replacing Runtime SHA."""
+
+        if self._render_ready:
+            return
+        self._prepare()
+        if self.render_repo is None or not self.render_expected_sha:
+            raise RuntimeErrorBase("MingLi RenderIntent extension is not configured")
+        if not (self.render_repo / ".git").exists() or not (self.render_repo / "src").is_dir():
+            raise RuntimeErrorBase("MingLi RenderIntent checkout unavailable")
+        try:
+            actual = subprocess.run(
+                ["git", "-C", str(self.render_repo), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeErrorBase("MingLi RenderIntent commit could not be verified") from exc
+        if actual != self.render_expected_sha:
+            raise RuntimeErrorBase("MingLi RenderIntent checkout is not the configured SHA")
+
+        if "mingli" not in sys.modules:
+            raise RuntimeErrorBase("fixed MingLi Runtime package is unavailable")
+
+        def load_extension_module(filename: str, module_name: str):
+            module = sys.modules.get(module_name)
+            if module is not None:
+                return module
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                self.render_repo / "src" / "mingli" / filename,
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeErrorBase("MingLi RenderIntent module could not be loaded")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception as exc:
+                sys.modules.pop(module_name, None)
+                raise RuntimeErrorBase("MingLi RenderIntent module import failed") from exc
+            return module
+        try:
+            extension_suffix = actual[:12]
+            confirmed_module = load_extension_module(
+                "confirmed_pillar_runtime.py",
+                "mingli._confirmed_pillar_extension_" + extension_suffix,
+            )
+            render_module = load_extension_module(
+                "render_intent.py",
+                "mingli._render_intent_extension_" + extension_suffix,
+            )
+            self._render_intent = render_module.render_phase23_intent
+            self._render_intent_enum = render_module.RenderIntent
+            self._render_confirmed = confirmed_module.run_confirmed_pillar_agent
+            self._render_confirmed_follow_up = (
+                render_module.render_confirmed_pillar_follow_up
+            )
+        except Exception as exc:
+            raise RuntimeErrorBase("MingLi RenderIntent public API import failed") from exc
+        if not all(
+            callable(value)
+            for value in (
+                self._render_intent,
+                self._render_intent_enum,
+                self._render_confirmed,
+                self._render_confirmed_follow_up,
+            )
+        ):
+            raise RuntimeErrorBase("MingLi RenderIntent public API is incomplete")
+        self._render_ready = True
+
+    @staticmethod
+    def _render_runtime_from_mapping(result: Mapping[str, Any]) -> SimpleNamespace:
+        final_answer = result.get("final_answer")
+        canonical_hash = result.get("canonical_hash")
+        statuses = result.get("effective_domain_statuses")
+        confidence = result.get("effective_domain_confidence")
+        scenario = result.get("scenario_assessment")
+        if (
+            not isinstance(final_answer, str)
+            or not final_answer.strip()
+            or not isinstance(canonical_hash, str)
+            or not canonical_hash.strip()
+            or not isinstance(statuses, Mapping)
+            or not isinstance(confidence, Mapping)
+            or scenario is not None and not isinstance(scenario, Mapping)
+        ):
+            raise ValueError("runtime artifacts required for RenderIntent are invalid")
+        return SimpleNamespace(
+            final_answer=final_answer,
+            canonical_hash=canonical_hash,
+            effective_domain_statuses=dict(statuses),
+            effective_domain_confidence=dict(confidence),
+            scenario_assessment=dict(scenario) if scenario is not None else None,
+        )
+
+    def render_intent(
+        self,
+        result: Mapping[str, Any],
+        *,
+        intent: str,
+        question: str,
+    ) -> dict[str, Any]:
+        """Select a view from an existing fixed-Runtime result without recomputing."""
+
+        self._prepare_render_intent()
+        runtime = self._render_runtime_from_mapping(result)
+        try:
+            selected = self._render_intent(
+                runtime,
+                self._render_intent_enum(intent),
+                question=question,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RenderIntent request is invalid") from exc
+        answer = getattr(selected, "answer", None)
+        supported = getattr(selected, "supported", None)
+        if not isinstance(answer, str) or not answer.strip() or not isinstance(supported, bool):
+            raise RuntimeErrorBase("RenderIntent output schema invalid")
+        return {
+            "final_answer": answer,
+            "supported": supported,
+            "intent": getattr(getattr(selected, "intent", None), "value", intent),
+            "topic": getattr(selected, "topic", None),
+            "runtime_result_hash": getattr(selected, "runtime_result_hash", runtime.canonical_hash),
+        }
+
+    def text_confirmed_pillars(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Dispatch a text-confirmed pillar input to the pinned extension only."""
+
+        self._prepare_render_intent()
+        try:
+            result = self._render_confirmed(payload).to_dict()
+        except Exception as exc:
+            raise ValueError("text-confirmed pillar contract is invalid") from exc
+        chart = result.get("chart") if isinstance(result, Mapping) else None
+        if not isinstance(result.get("final_answer"), str) or not result["final_answer"].strip() or not isinstance(chart, Mapping):
+            raise RuntimeErrorBase("text-confirmed Runtime output schema invalid")
+        return dict(result)
+
+    def confirmed_follow_up(
+        self, result: Mapping[str, Any], question: str
+    ) -> dict[str, Any]:
+        """Use only the extension's formal confirmed-pillar follow-up contract."""
+
+        self._prepare_render_intent()
+        canonical_hash = result.get("canonical_hash")
+        if not isinstance(canonical_hash, str) or not canonical_hash.strip():
+            raise ValueError("confirmed-pillar runtime result hash is required")
+        selected = self._render_confirmed_follow_up(
+            SimpleNamespace(canonical_hash=canonical_hash), question
+        )
+        answer = getattr(selected, "answer", None)
+        supported = getattr(selected, "supported", None)
+        if not isinstance(answer, str) or not answer.strip() or not isinstance(supported, bool):
+            raise RuntimeErrorBase("confirmed-pillar follow-up output schema invalid")
+        return {
+            "final_answer": answer,
+            "supported": supported,
+            "intent": getattr(getattr(selected, "intent", None), "value", "follow_up"),
+            "topic": getattr(selected, "topic", None),
+            "runtime_result_hash": getattr(selected, "runtime_result_hash", canonical_hash),
+        }
 
     def _validate(self, payload: dict[str, Any], full: bool = True) -> None:
         chart = payload.get("chart_input")
@@ -467,6 +647,8 @@ class MingLiConsole:
             )
         ):
             return True
+        if len(re.findall(r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]", normalized)) >= 4:
+            return True
         return bool(
             re.search(r"\b\d{4}-\d{1,2}-\d{1,2}\b", normalized)
             and re.search(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", normalized)
@@ -579,6 +761,303 @@ class MingLiConsole:
             "city": ",".join(city),
         }
 
+    @staticmethod
+    def _manual_pillar_candidate(
+        text: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        pairs = re.findall(r"[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]", text)
+        if "四柱" not in text and len(pairs) < 4:
+            return None, None
+        if len(pairs) != 4 or any(value not in SEXAGENARY for value in pairs):
+            return None, "四柱必须按年、月、日、时提供四个合法干支"
+        day_master = re.search(r"日主\s*[:：]?\s*([甲乙丙丁戊己庚辛壬癸])", text)
+        if day_master is None:
+            return None, "日主"
+        updates, _ = MingLiConsole._text_intake_updates(text)
+        gender = updates.get("gender")
+        if gender not in {"male", "female"}:
+            return None, "性别"
+        if day_master.group(1) != pairs[2][0]:
+            return None, "日主与日柱天干不一致"
+        return {
+            "year_pillar": pairs[0],
+            "month_pillar": pairs[1],
+            "day_pillar": pairs[2],
+            "hour_pillar": pairs[3],
+            "day_master": day_master.group(1),
+            "gender": gender,
+        }, None
+
+    @staticmethod
+    def _manual_pillar_prompt(candidate: Mapping[str, str]) -> str:
+        return (
+            "【手动四柱候选】\n"
+            f"年柱：{candidate['year_pillar']}\n"
+            f"月柱：{candidate['month_pillar']}\n"
+            f"日柱：{candidate['day_pillar']}\n"
+            f"时柱：{candidate['hour_pillar']}\n"
+            f"日主：{candidate['day_master']}\n"
+            f"性别：{'男' if candidate['gender'] == 'male' else '女'}\n\n"
+            "请回复“确认并分析”。如需更正，请发送“年柱：甲子”等字段；更正后会再次要求确认。"
+        )
+
+    async def _begin_manual_pillars(
+        self, user_id: str, chat_id: str, candidate: dict[str, str]
+    ) -> bool:
+        session_id = uuid.uuid4().hex
+        session = Session(
+            "manual_pillars",
+            step="awaiting_confirmation",
+            data={
+                "candidate": candidate,
+                "trace_id": uuid.uuid4().hex,
+                "session_id": session_id,
+                "text_confirmation_id": "text-confirmed-" + session_id,
+                "runtime_idempotency_key": "text-confirmed-runtime-" + session_id,
+                "runtime_dispatch_attempted": False,
+            },
+        )
+        self.sessions[str(user_id)] = session
+        await self._reply(chat_id, self._manual_pillar_prompt(candidate))
+        return True
+
+    def _save_confirmed_case(
+        self,
+        user_id: str,
+        *,
+        source: str,
+        candidate: Mapping[str, str],
+        trace_id: str,
+        result: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        final = str(result["final_answer"])
+        result_json = json.dumps(
+            result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        result_hash = "sha256:" + hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        case_id = "case-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        pillars = {
+            "year": candidate["year_pillar"],
+            "month": candidate["month_pillar"],
+            "day": candidate["day_pillar"],
+            "hour": candidate["hour_pillar"],
+        }
+        case = {
+            "case_id": case_id,
+            "customer_id": str(user_id),
+            "display_name": str(user_id),
+            "gender": candidate["gender"],
+            "calendar_type": None,
+            "birth_datetime": None,
+            "birth_location": None,
+            "true_solar_time_policy": None,
+            "topic": "confirmed_pillars",
+            "reality_context": "",
+            "normalized_input": {
+                "source": source,
+                "trace_id": trace_id,
+                "confirmed_pillars": pillars,
+                "day_master": candidate["day_master"],
+                "runtime_result_hash": result_hash,
+            },
+            "mingli_commit_sha": self.runtime.commit_sha,
+            "runtime_version": result.get("calculation_version"),
+            "result": final,
+            "confidence": "low",
+            "created_at": now,
+            "updated_at": now,
+            "status": "completed",
+        }
+        try:
+            self.repo.save(case)
+        except Exception:
+            log.warning("confirmed case save failed: %s", type(sys.exc_info()[1]).__name__)
+        self.completed[str(user_id)] = {
+            "mode": "confirmed_pillars",
+            "source": source,
+            "case_id": case_id,
+            "confirmed_pillars": pillars,
+            "day_master": candidate["day_master"],
+            "gender": candidate["gender"],
+            "trace_id": trace_id,
+            "runtime_result_hash": result_hash,
+            "runtime_result": dict(result),
+        }
+        return case_id, result_hash
+
+    async def _confirm_manual_pillars(
+        self, user_id: str, chat_id: str, session: Session, text: str
+    ) -> bool:
+        value = text.strip()
+        normalized = value.casefold()
+        candidate = session.data.get("candidate")
+        if not isinstance(candidate, dict):
+            await self._reply(chat_id, "手动四柱候选已失效，请重新提供四柱。")
+            return True
+        if normalized in {"取消", "cancel"}:
+            self.sessions.pop(str(user_id), None)
+            await self._reply(chat_id, "已取消当前手动四柱候选。")
+            return True
+        if session.step == "done":
+            if normalized in {"确认", "确认并分析", "confirm"}:
+                await self._reply(chat_id, "本次手动四柱已处理，不会重复调用 Runtime。")
+                return True
+            return False
+
+        match = re.fullmatch(
+            r"(?:修改\s*)?(年柱|月柱|日柱|时柱|日主|性别)\s*[=:：]\s*([^\s，,；;]+)",
+            value,
+        )
+        if match:
+            field = {
+                "年柱": "year_pillar",
+                "月柱": "month_pillar",
+                "日柱": "day_pillar",
+                "时柱": "hour_pillar",
+                "日主": "day_master",
+                "性别": "gender",
+            }[match.group(1)]
+            replacement = match.group(2)
+            updated = dict(candidate)
+            if field == "gender":
+                replacement = {
+                    "男": "male",
+                    "男命": "male",
+                    "male": "male",
+                    "女": "female",
+                    "女命": "female",
+                    "female": "female",
+                }.get(replacement.casefold(), "")
+                valid = replacement in {"male", "female"}
+            elif field == "day_master":
+                valid = replacement in "甲乙丙丁戊己庚辛壬癸"
+            else:
+                valid = replacement in SEXAGENARY
+            if not valid:
+                await self._reply(chat_id, "validation_failed: 更正值非法，手动四柱候选尚未确认。")
+                return True
+            updated[field] = replacement
+            if updated["day_master"] != updated["day_pillar"][0]:
+                await self._reply(chat_id, "validation_failed: 日柱与日主不一致，本次不会进入测算。")
+                return True
+            session.data["candidate"] = updated
+            session.step = "awaiting_confirmation"
+            await self._reply(
+                chat_id,
+                "手动四柱候选已更新，尚未确认。\n" + self._manual_pillar_prompt(updated),
+            )
+            return True
+
+        if normalized not in {"确认", "确认并分析", "confirm"}:
+            await self._reply(chat_id, "手动四柱候选尚未确认。" + self._manual_pillar_prompt(candidate))
+            return True
+        if candidate["day_master"] != candidate["day_pillar"][0]:
+            await self._reply(chat_id, "validation_failed: 日柱与日主不一致，本次不会进入测算。")
+            return True
+
+        pillars = {
+            "year": candidate["year_pillar"],
+            "month": candidate["month_pillar"],
+            "day": candidate["day_pillar"],
+            "hour": candidate["hour_pillar"],
+        }
+        payload = {
+            "pillars": pillars,
+            "day_master": candidate["day_master"],
+            "gender": candidate["gender"],
+            "source": "text_confirmed",
+            "confirmation_status": "confirmed",
+            "trace_id": session.data["trace_id"],
+            "idempotency_key": session.data["runtime_idempotency_key"],
+            "text_confirmation_id": session.data["text_confirmation_id"],
+        }
+        session.data["runtime_dispatch_attempted"] = True
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.runtime.text_confirmed_pillars, payload),
+                timeout=float(os.getenv("MINGLI_RUNTIME_TIMEOUT", "30")),
+            )
+        except asyncio.TimeoutError:
+            session.step = "done"
+            await self._reply(chat_id, "MingLi Runtime 超时，本次手动四柱未生成结果。")
+            return True
+        except Exception as exc:
+            session.step = "done"
+            log.warning("MingLi text-confirmed runtime failed for admin=%s: %s", user_id, type(exc).__name__)
+            await self._reply(chat_id, "MingLi Runtime 当前不可用或确认内容不符合接口要求，本次不会改交通用回复。")
+            return True
+        final = str(result.get("final_answer", "")).strip()
+        if not final:
+            session.step = "done"
+            await self._reply(chat_id, "MingLi Runtime 返回结果无效，本次不会改交通用回复。")
+            return True
+        if not final.endswith(DISCLAIMER):
+            final += "\n" + DISCLAIMER
+        case_id, result_hash = self._save_confirmed_case(
+            user_id,
+            source="text_confirmed",
+            candidate=candidate,
+            trace_id=str(session.data["trace_id"]),
+            result=result,
+        )
+        session.data["active_case_id"] = case_id
+        session.data["runtime_result_hash"] = result_hash
+        session.step = "done"
+        await self._reply(chat_id, final)
+        return True
+
+    @staticmethod
+    def _is_active_case_follow_up(text: str) -> bool:
+        continuation = ("继续看", "再看", "那", "还有")
+        topics = ("事业", "财运", "感情", "考公", "考编", "复合")
+        return any(token in text for token in continuation) and any(
+            topic in text for topic in topics
+        )
+
+    async def _active_case_follow_up(
+        self, user_id: str, chat_id: str, question: str
+    ) -> bool:
+        active = self.completed.get(str(user_id))
+        if not active:
+            return False
+        runtime_result = active.get("runtime_result")
+        if not isinstance(runtime_result, Mapping):
+            await self._reply(
+                chat_id,
+                "当前案例没有可支持该续问的正式结果，请先完成一次完整分析。\n" + DISCLAIMER,
+            )
+            return True
+        try:
+            if active.get("mode") == "confirmed_pillars":
+                rendered = await asyncio.to_thread(
+                    self.runtime.confirmed_follow_up, runtime_result, question
+                )
+            else:
+                rendered = await asyncio.to_thread(
+                    self.runtime.render_intent,
+                    runtime_result,
+                    intent="follow_up",
+                    question=question,
+                )
+        except Exception as exc:
+            log.warning("MingLi active-case follow-up failed for admin=%s: %s", user_id, type(exc).__name__)
+            await self._reply(chat_id, "MingLi 当前无法提供该续问，不会改交通用回复。")
+            return True
+        final = str(rendered.get("final_answer", "")).strip()
+        if not final:
+            await self._reply(chat_id, "MingLi 当前无法提供该续问，不会改交通用回复。")
+            return True
+        if not final.endswith(DISCLAIMER):
+            final += "\n" + DISCLAIMER
+        if rendered.get("supported") is True and active.get("mode") != "confirmed_pillars":
+            final = await self._append_reviewed_references(final, question)
+        await self._reply(chat_id, final)
+        return True
+
     async def _complete_text_intake(
         self, user_id: str, chat_id: str, session: Session, text: str
     ) -> bool:
@@ -650,10 +1129,12 @@ class MingLiConsole:
         except Exception:
             log.warning("case save failed: %s", type(sys.exc_info()[1]).__name__)
         self.completed[str(user_id)] = {
+            "mode": "full",
             "chart": normalized_chart,
             "case_id": case_id,
             "topic": "综合",
             "reality_context": "",
+            "runtime_result": dict(result),
         }
         session.data["active_case_id"] = case_id
         session.step = "done"
@@ -890,6 +1371,14 @@ class MingLiConsole:
             runtime_result_hash=result_hash,
             status="COMPLETED",
         )
+        case_id, _ = self._save_confirmed_case(
+            user_id,
+            source="image_confirmed",
+            candidate=candidate,
+            trace_id=str(session.data["trace_id"]),
+            result=result,
+        )
+        session.data["active_case_id"] = case_id
         session.data["runtime_result_hash"] = result_hash
         session.data["state"] = "COMPLETED"
         await self._reply(chat_id, final if final.endswith(DISCLAIMER) else final + "\n" + DISCLAIMER)
@@ -1083,7 +1572,21 @@ class MingLiConsole:
         result = await self._run(self._payload_from_chart(chart, message))
         if result is None:
             await self._reply(chat_id, "MingLi Runtime 超时或不可用，未生成评论回复。"); return True
-        rendered = str(result.get("final_answer", ""))
+        try:
+            selected = await asyncio.to_thread(
+                self.runtime.render_intent,
+                result,
+                intent="comment",
+                question=str(session.data.get("topic", "")),
+            )
+        except Exception as exc:
+            log.warning("MingLi comment RenderIntent failed for admin=%s: %s", user_id, type(exc).__name__)
+            await self._reply(chat_id, "MingLi 当前无法生成评论回复，不会改交通用回复。")
+            return True
+        rendered = str(selected.get("final_answer", ""))
+        if not rendered.strip():
+            await self._reply(chat_id, "MingLi 当前无法生成评论回复，不会改交通用回复。")
+            return True
         compressed = "\n".join(line for line in rendered.splitlines() if line.strip())
         compressed = compressed[:max(0, limit - len(DISCLAIMER) - 1)].rstrip() + "\n" + DISCLAIMER
         compressed = await self._append_reviewed_references(
@@ -1096,6 +1599,8 @@ class MingLiConsole:
             if self._is_explicit_mingli_text(text):
                 return await self._deny(chat_id)
             return False
+        if self._is_active_case_follow_up(text):
+            return await self._active_case_follow_up(user_id, chat_id, text)
         image_session = self._image_session(user_id, chat_id)
         session = image_session or self.sessions.get(str(user_id))
         if not session:
@@ -1103,6 +1608,15 @@ class MingLiConsole:
                 aliases = {"新客户完整测算": "/new", "评论区快速回复": "/quick", "专项问题分析": "/analyze", "历史案例": "/history", "取消当前任务": "/cancel"}
                 return await self.command(user_id, chat_id, aliases[text.strip()])
             if self._is_explicit_mingli_text(text):
+                candidate, manual_error = self._manual_pillar_candidate(text)
+                if manual_error is not None:
+                    await self._reply(
+                        chat_id,
+                        "validation_failed: " + manual_error + "，本次不会进入测算。",
+                    )
+                    return True
+                if candidate is not None:
+                    return await self._begin_manual_pillars(user_id, chat_id, candidate)
                 session = Session("text_intake", step="collecting", data={"chart": {}})
                 self.sessions[str(user_id)] = session
                 return await self._complete_text_intake(user_id, chat_id, session, text)
@@ -1122,6 +1636,8 @@ class MingLiConsole:
             if session.step == "done":
                 return False
             return await self._complete_text_intake(user_id, chat_id, session, text)
+        if session.mode == "manual_pillars":
+            return await self._confirm_manual_pillars(user_id, chat_id, session, text)
         if session.mode == "new":
             return await self._new_step(user_id, chat_id, session, text.strip())
         if session.mode == "quick":
@@ -1145,14 +1661,26 @@ class MingLiConsole:
             result = await self._run(payload)
             if result is None:
                 await self._reply(chat_id, "MingLi Runtime 超时或不可用，未生成专项结果。"); return True
-            extra = self._scenario_text(result, topic)
-            if topic not in {"事业", "财运", "感情", "考公考编", "复合"}:
-                extra = f"\n专项状态：unsupported。固定 SHA 当前专项场景仅支持 career_exam、relationship_reunion；本主题仅返回基础 Runtime 结果。"
-            answer = str(result.get("final_answer", "")) + extra + ("\n" if extra else "") + DISCLAIMER
-            await self._reply(
-                chat_id,
-                await self._append_reviewed_references(answer, topic),
-            )
+            try:
+                rendered = await asyncio.to_thread(
+                    self.runtime.render_intent,
+                    result,
+                    intent="focused_question",
+                    question=text,
+                )
+            except Exception as exc:
+                log.warning("MingLi focused RenderIntent failed for admin=%s: %s", user_id, type(exc).__name__)
+                await self._reply(chat_id, "MingLi 当前无法提供该专项问题，不会改交通用回复。")
+                return True
+            answer = str(rendered.get("final_answer", "")).strip()
+            if not answer:
+                await self._reply(chat_id, "MingLi 当前无法提供该专项问题，不会改交通用回复。")
+                return True
+            if not answer.endswith(DISCLAIMER):
+                answer += DISCLAIMER
+            if rendered.get("supported") is True:
+                answer = await self._append_reviewed_references(answer, topic)
+            await self._reply(chat_id, answer)
             session.step = "done"; return True
         return False
 
@@ -1223,5 +1751,12 @@ class MingLiConsole:
         case = {"case_id": case_id, "customer_id": str(user_id), "display_name": session.data["display_name"], "gender": session.data["gender"], "calendar_type": session.data["calendar"], "birth_datetime": session.data["birth_date"] + " " + session.data["birth_time"], "birth_location": loc, "true_solar_time_policy": session.data["true_solar_time"], "topic": session.data["topic"], "reality_context": session.data["reality_context"], "normalized_input": payload, "mingli_commit_sha": self.runtime.commit_sha, "runtime_version": result.get("calculation_version"), "result": final, "confidence": "low", "created_at": now, "updated_at": now, "status": "completed"}
         try: self.repo.save(case)
         except Exception: log.warning("case save failed: %s", type(sys.exc_info()[1]).__name__)
-        self.completed[str(user_id)] = {"chart": chart, "case_id": case_id, "topic": session.data["topic"], "reality_context": session.data["reality_context"]}
+        self.completed[str(user_id)] = {
+            "mode": "full",
+            "chart": chart,
+            "case_id": case_id,
+            "topic": session.data["topic"],
+            "reality_context": session.data["reality_context"],
+            "runtime_result": dict(result),
+        }
         session.step = "done"; return True

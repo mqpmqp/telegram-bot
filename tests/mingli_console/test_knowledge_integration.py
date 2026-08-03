@@ -77,6 +77,13 @@ class _FakeRuntime:
         self.calls.append(payload)
         return {"final_answer": "图片 Runtime 原文", "calculation_version": "test"}
 
+    def render_intent(
+        self, _result: dict[str, object], *, intent: str, question: str
+    ) -> dict[str, object]:
+        assert intent in {"comment", "focused_question", "follow_up"}
+        assert question
+        return {"final_answer": "Runtime 原文", "supported": True}
+
 
 class _FakeKnowledge:
     def __init__(self, references: list[dict[str, object]]) -> None:

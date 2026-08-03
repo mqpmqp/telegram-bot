@@ -131,6 +131,33 @@ class RenderIntentRoutingTests(unittest.TestCase):
         self.assertEqual(1, len(self.runtime.text_confirmed_calls))
         self.assertEqual([], self.knowledge.calls)
 
+    def test_manual_pillars_reject_invalid_or_mismatched_values_without_runtime(self) -> None:
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "chat",
+                    "四柱：甲子 乙丑 丙寅 丁卯，日主：乙，性别：男",
+                )
+            )
+        )
+        self.assertEqual([], self.runtime.text_confirmed_calls)
+        self.assertIn("日主", self.sent[-1][1])
+        self.assertIn("validation_failed", self.sent[-1][1])
+
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "chat",
+                    "四柱：甲子 乙丑 丙寅 丁A，日主：丙，性别：男",
+                )
+            )
+        )
+        self.assertEqual([], self.runtime.text_confirmed_calls)
+        self.assertIn("四柱", self.sent[-1][1])
+        self.assertIn("validation_failed", self.sent[-1][1])
+
     def test_active_full_case_follow_up_uses_saved_runtime_artifacts(self) -> None:
         self.console.completed["42"] = {
             "mode": "full",
@@ -147,6 +174,21 @@ class RenderIntentRoutingTests(unittest.TestCase):
         _, intent, question = self.runtime.render_calls[0]
         self.assertEqual("follow_up", intent)
         self.assertEqual("继续看财运", question)
+        self.assertIn("follow_up:继续看财运", self.sent[-1][1])
+
+    def test_completed_birth_text_routes_follow_up_without_new_runtime(self) -> None:
+        message = (
+            "请看八字：性别：男，公历，出生日期：1990-01-01，"
+            "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否"
+        )
+
+        self.assertTrue(self.arun(self.console.text("42", "chat", message)))
+        self.assertEqual(1, len(self.runtime.full_calls))
+        self.assertEqual("full", self.console.completed["42"]["mode"])
+
+        self.assertTrue(self.arun(self.console.text("42", "chat", "继续看财运")))
+        self.assertEqual(1, len(self.runtime.full_calls))
+        self.assertEqual(1, len(self.runtime.render_calls))
         self.assertIn("follow_up:继续看财运", self.sent[-1][1])
 
     def test_confirmed_pillar_follow_up_is_limited_and_never_generic(self) -> None:
@@ -179,4 +221,3 @@ class RenderIntentRoutingTests(unittest.TestCase):
         self.assertEqual("focused_question", intent)
         self.assertEqual("只看当前问题", question)
         self.assertNotIn("完整八段报告", self.sent[-1][1])
-
