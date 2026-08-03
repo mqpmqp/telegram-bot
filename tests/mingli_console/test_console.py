@@ -65,6 +65,73 @@ class ConsoleTests(unittest.TestCase):
                 )
                 self.assertIn("内部工作控制台", self.sent[-1][1])
 
+    def test_admin_ordinary_text_without_a_session_is_not_claimed(self):
+        self.assertFalse(self.arun(self.console.text("42", "c", "今天吃什么？")))
+        self.assertEqual([], self.runtime.calls)
+        self.assertEqual([], self.sent)
+        self.assertNotIn("42", self.console.sessions)
+
+    def test_admin_complete_birth_text_runs_once_without_new(self):
+        message = (
+            "请看八字：性别：男，公历，出生日期：1990-01-01，"
+            "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否"
+        )
+
+        self.assertTrue(self.arun(self.console.text("42", "c", message)))
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("仅供文化研究与娱乐参考。", self.sent[-1][1])
+        self.assertIn("42", self.console.completed)
+        self.assertEqual("1990-01-01", self.console.completed["42"]["chart"]["birth_date"])
+
+    def test_admin_incomplete_birth_text_lists_only_missing_and_continues(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "请排盘：性别：女，公历，出生日期：1990-01-01",
+                )
+            )
+        )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生时间", self.sent[-1][1])
+        self.assertIn("出生地", self.sent[-1][1])
+        self.assertIn("时区", self.sent[-1][1])
+        self.assertIn("真太阳时", self.sent[-1][1])
+        self.assertNotIn("性别", self.sent[-1][1])
+        self.assertEqual("female", self.console.sessions["42"].data["chart"]["gender"])
+
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("42", self.console.completed)
+
+    def test_admin_birth_text_rejects_invalid_date_without_runtime(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "请看命盘：性别：男，公历，出生日期：1990-02-30，"
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生日期", self.sent[-1][1])
+        self.assertIn("无效", self.sent[-1][1])
+
     def test_new_state_missing_and_cancel(self):
         self.assertTrue(self.arun(self.console.command("42", "c", "/new")))
         self.assertTrue(self.arun(self.console.text("42", "c", "案例A")))
