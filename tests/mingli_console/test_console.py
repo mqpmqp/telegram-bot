@@ -231,6 +231,37 @@ class ConsoleTests(unittest.TestCase):
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male"}, "anchor_year": 2026})
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male", "calendar": "lunar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {}, "true_solar_time": False}, "anchor_year": 2026})
 
+    def test_confirmed_pillars_forwards_runtime_audit_ids(self):
+        from mingli_console.console import MingLiRuntimeAdapter
+
+        adapter = MingLiRuntimeAdapter()
+        result = adapter.confirmed_pillars(
+            {
+                "image_chart_confirmation": {
+                    "contract": "mingli-image-chart-confirmation@1.2",
+                    "confirmation_status": "confirmed",
+                    "runtime_dispatch": "confirmed_pillars",
+                    "chart_candidate": {
+                        "pillars": {
+                            "year": "甲子",
+                            "month": "乙丑",
+                            "day": "丙寅",
+                            "hour": "丁卯",
+                        },
+                        "day_master": "丙",
+                        "gender": "male",
+                        "birth_datetime": None,
+                        "birth_place": None,
+                        "calendar_type": None,
+                    },
+                },
+                "trace_id": "trace-confirmed-pillar-audit",
+                "idempotency_key": "confirmed-pillar-audit-key",
+            }
+        )
+
+        self.assertTrue(str(result["final_answer"]).strip())
+
     def test_history_queries_export_and_revision(self):
         payload = {"chart_input": {"gender": "male", "calendar": "solar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {"city": "福州"}, "true_solar_time": False}, "anchor_year": 2026, "scenario": None, "reality": {}, "fusion_evidence": [], "annual_evidence": [], "advice_codes": []}
         self.console.repo.save({"case_id": "case-x", "customer_id": "42", "display_name": "A", "gender": "男", "calendar_type": "公历", "birth_datetime": "1990-01-01 10:30", "birth_location": {"city": "福州"}, "true_solar_time_policy": "否", "topic": "事业", "reality_context": "x", "normalized_input": payload, "mingli_commit_sha": "old", "runtime_version": "old", "result": "old result", "confidence": "low", "created_at": "old-time", "updated_at": "old-time", "status": "completed"})
