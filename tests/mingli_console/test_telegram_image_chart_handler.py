@@ -431,14 +431,55 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
         self.assertNotIn(("chat", "7"), self.console.sessions)
         self.assertIn("暂未开放", self.sent[-1][1])
 
-    def test_console_messages_are_consumed_but_ordinary_text_propagates(self) -> None:
+    def test_console_messages_are_consumed_but_non_admin_ordinary_text_propagates(self) -> None:
         command_update = self.update_for(text="/new")
         with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
             self.arun(self.adapter._handle_mingli_command(command_update, None))
         self.assertEqual("new", self.console.sessions["42"].mode)
 
         self.console.sessions.clear()
-        self.assertIsNone(self.arun(self.adapter._handle_mingli_text(self.update_for(text="ordinary chat"), None)))
+        sent_before = list(self.sent)
+        self.assertIsNone(
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(user_id="7", text="ordinary chat"), None
+                )
+            )
+        )
+        self.assertEqual(sent_before, self.sent)
+
+    def test_non_admin_explicit_mingli_text_is_rejected(self) -> None:
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(user_id="7", text="请帮我看四柱"), None
+                )
+            )
+        self.assertIn("内部工作控制台", self.sent[-1][1])
+
+    def test_admin_birth_text_without_new_is_consumed_before_generic_route(self) -> None:
+        text = (
+            "请看八字：性别：男，公历，出生日期：1990-01-01，"
+            "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否"
+        )
+
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(self.adapter._handle_mingli_text(self.update_for(text=text), None))
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("仅供文化研究与娱乐参考。", self.sent[-1][1])
+
+    def test_admin_incomplete_birth_text_without_new_is_consumed_with_no_runtime(self) -> None:
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(text="请排盘：性别：女，公历，出生日期：1990-01-01"),
+                    None,
+                )
+            )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生时间", self.sent[-1][1])
 
     def test_existing_commands_and_image_confirmation_route_through_early_handlers(self) -> None:
         for command in ("/new", "/quick", "/analyze", "/history", "/cancel"):

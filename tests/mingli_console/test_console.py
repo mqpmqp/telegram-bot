@@ -47,6 +47,109 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(self.arun(self.console.command("42", "c", "/start")))
         self.assertIn("MingLi 命理师控制台", self.sent[-1][1])
 
+    def test_non_admin_plain_text_is_not_claimed_but_mingli_text_is_denied(self):
+        self.assertFalse(self.arun(self.console.confirm("7", "c", "ordinary chat")))
+        self.assertFalse(self.arun(self.console.text("7", "c", "ordinary chat")))
+        self.assertEqual([], self.sent)
+
+        for explicit_mingli_text in (
+            "请帮我看八字",
+            "我的四柱是甲子乙丑丙寅丁卯",
+            "出生资料是 1990-01-01 10:30",
+        ):
+            with self.subTest(text=explicit_mingli_text):
+                self.assertTrue(
+                    self.arun(
+                        self.console.confirm("7", "c", explicit_mingli_text)
+                    )
+                )
+                self.assertIn("内部工作控制台", self.sent[-1][1])
+
+    def test_admin_ordinary_text_without_a_session_is_not_claimed(self):
+        self.assertFalse(self.arun(self.console.text("42", "c", "今天吃什么？")))
+        self.assertEqual([], self.runtime.calls)
+        self.assertEqual([], self.sent)
+        self.assertNotIn("42", self.console.sessions)
+
+    def test_admin_complete_birth_text_runs_once_without_new(self):
+        message = (
+            "请看八字：性别：男，公历，出生日期：1990-01-01，"
+            "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否"
+        )
+
+        self.assertTrue(self.arun(self.console.text("42", "c", message)))
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("仅供文化研究与娱乐参考。", self.sent[-1][1])
+        self.assertIn("42", self.console.completed)
+        self.assertEqual("1990-01-01", self.console.completed["42"]["chart"]["birth_date"])
+
+    def test_admin_incomplete_birth_text_lists_only_missing_and_continues(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "请排盘：性别：女，公历，出生日期：1990-01-01",
+                )
+            )
+        )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生时间", self.sent[-1][1])
+        self.assertIn("出生地", self.sent[-1][1])
+        self.assertIn("时区", self.sent[-1][1])
+        self.assertIn("真太阳时", self.sent[-1][1])
+        self.assertNotIn("性别", self.sent[-1][1])
+        self.assertEqual("female", self.console.sessions["42"].data["chart"]["gender"])
+
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("42", self.console.completed)
+
+    def test_admin_lunar_birth_text_accepts_explicit_unlabelled_gender(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "八字：女，农历，闰月：是，出生日期：1990-01-01，"
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual(1, len(self.runtime.calls))
+        chart = self.runtime.calls[0]["chart_input"]
+        self.assertEqual("female", chart["gender"])
+        self.assertEqual("lunar", chart["calendar"])
+        self.assertTrue(chart["is_leap_month"])
+
+    def test_admin_birth_text_rejects_invalid_date_without_runtime(self):
+        self.assertTrue(
+            self.arun(
+                self.console.text(
+                    "42",
+                    "c",
+                    "请看命盘：性别：男，公历，出生日期：1990-02-30，"
+                    "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否",
+                )
+            )
+        )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生日期", self.sent[-1][1])
+        self.assertIn("无效", self.sent[-1][1])
+
     def test_new_state_missing_and_cancel(self):
         self.assertTrue(self.arun(self.console.command("42", "c", "/new")))
         self.assertTrue(self.arun(self.console.text("42", "c", "案例A")))
@@ -127,6 +230,37 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual("129ebd09df5c924cc4466e58271938f9b9a19875", FIXED_MINGLI_SHA)
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male"}, "anchor_year": 2026})
         with self.assertRaises(ValueError): adapter._validate({"chart_input": {"gender": "male", "calendar": "lunar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {}, "true_solar_time": False}, "anchor_year": 2026})
+
+    def test_confirmed_pillars_forwards_runtime_audit_ids(self):
+        from mingli_console.console import MingLiRuntimeAdapter
+
+        adapter = MingLiRuntimeAdapter()
+        result = adapter.confirmed_pillars(
+            {
+                "image_chart_confirmation": {
+                    "contract": "mingli-image-chart-confirmation@1.2",
+                    "confirmation_status": "confirmed",
+                    "runtime_dispatch": "confirmed_pillars",
+                    "chart_candidate": {
+                        "pillars": {
+                            "year": "甲子",
+                            "month": "乙丑",
+                            "day": "丙寅",
+                            "hour": "丁卯",
+                        },
+                        "day_master": "丙",
+                        "gender": "male",
+                        "birth_datetime": None,
+                        "birth_place": None,
+                        "calendar_type": None,
+                    },
+                },
+                "trace_id": "trace-confirmed-pillar-audit",
+                "idempotency_key": "confirmed-pillar-audit-key",
+            }
+        )
+
+        self.assertTrue(str(result["final_answer"]).strip())
 
     def test_history_queries_export_and_revision(self):
         payload = {"chart_input": {"gender": "male", "calendar": "solar", "birth_date": "1990-01-01", "birth_time": "10:30", "timezone": "Asia/Shanghai", "birth_location": {"city": "福州"}, "true_solar_time": False}, "anchor_year": 2026, "scenario": None, "reality": {}, "fusion_evidence": [], "annual_evidence": [], "advice_codes": []}
