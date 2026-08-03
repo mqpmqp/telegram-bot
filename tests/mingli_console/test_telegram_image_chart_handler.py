@@ -457,6 +457,30 @@ class TelegramImageChartHandlerTests(unittest.TestCase):
             )
         self.assertIn("内部工作控制台", self.sent[-1][1])
 
+    def test_admin_birth_text_without_new_is_consumed_before_generic_route(self) -> None:
+        text = (
+            "请看八字：性别：男，公历，出生日期：1990-01-01，"
+            "出生时间：10:30，出生地：福州，时区：Asia/Shanghai，真太阳时：否"
+        )
+
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(self.adapter._handle_mingli_text(self.update_for(text=text), None))
+
+        self.assertEqual(1, len(self.runtime.calls))
+        self.assertIn("仅供文化研究与娱乐参考。", self.sent[-1][1])
+
+    def test_admin_incomplete_birth_text_without_new_is_consumed_with_no_runtime(self) -> None:
+        with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
+            self.arun(
+                self.adapter._handle_mingli_text(
+                    self.update_for(text="请排盘：性别：女，公历，出生日期：1990-01-01"),
+                    None,
+                )
+            )
+
+        self.assertEqual([], self.runtime.calls)
+        self.assertIn("出生时间", self.sent[-1][1])
+
     def test_existing_commands_and_image_confirmation_route_through_early_handlers(self) -> None:
         for command in ("/new", "/quick", "/analyze", "/history", "/cancel"):
             with self.assertRaises(telegram_adapter.ApplicationHandlerStop):
